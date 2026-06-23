@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.6.1
+
+- Add real-time agent_crash detection in trace mode.
+- Add OOM crash detection.
+- Add cgroup-level event filtering with v1/v2 compatibility.
+- Support QwenCode skill discovery via per-user home scanning.
+- Support SLS Logtail activation reversible via dynamic path.
+- Support bridging ilogtail `SLS_LOG_PATH` into config via token-collector switch.
+- Default `traceEnabled` to false to drop conversation content from SLS by default.
+- Drop `gen_ai.system_instructions` from SLS uploads when `traceEnabled=false`.
+- Refactor session_id and conversation_id derivation from response_id instead of message content.
+- Fix CJK deadloop detection, `kill()` error check, and SIGKILL escalation.
+- Fix SQLite read/write contention via VACUUM optimization.
+- Fix rpm-build.sh agentsight build failures.
+- Fix allow log path re-init on repeated new+start.
+
+## 0.6.0
+
+- Add deadloop detection and auto-kill mechanism for runaway agent processes.
+- Add retry storm detection and `/metrics` interruption counters.
+- Add BPF-layer HTTP protocol filter and wildcard capture (`*`) for unknown IP/port targets.
+- Add client-side hybrid encryption for sensitive message fields.
+- Add `traceEnabled` configuration toggle with SLS upload layer enforcement.
+- Add HTTP domain rules resolved to tcpsniff BPF map via DNS.
+- Add default DashScope HTTPS rule and `anolisa_release` module.
+- Add FFI interface for `tcp_targets` and `input_delta` config.
+- Add CO-RE compatibility to UDP DNS probe for kernel 6.0+.
+- Support runtime SLS logtail path via config hot-reload.
+- Expand interruption types and add logtail export.
+- Restructure config to `https`/`http` rules.
+- Refactor query `stats.db` by `tool_use_id` and unify savings display.
+- Refactor load encryption public key from `agentsight.json`.
+- Fix decode HPACK Huffman headers.
+- Fix BoringSSL probe attachment, FFI event delivery, and chunked-body panic.
+- Fix preserve initial SSE chunk in event-stream responses.
+- Fix `c_char` / BPF comm portability (i8 vs u8).
+- Remove dead code and deprecated APIs.
+
 ## 0.5.0
 
 - Add Claude Code support including SSL probe attach for BoringSSL, Anthropic SSE thinking/tool_use content blocks, and `message.id`-based session correlation.

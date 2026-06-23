@@ -31,6 +31,20 @@ export function mapErrorToLLMMessage(stderr: string, context?: { id?: string }):
   if (stderr.includes('Insufficient disk space') || stderr.includes('insufficient')) {
     return 'Insufficient disk space for snapshot. Delete old snapshots to free space.';
   }
+  // daemon flattens anyhow chains via `format!("{:#}", e)`, so inner io errors leak generic substrings.
+  if (stderr.includes('cwd scan failed')) {
+    return 'ws-ckpt could not scan /proc to verify workspace occupants ' +
+      '(typically a transient /proc/canonicalize race). ' +
+      'This is retryable — wait a moment and try again.';
+  }
+  if (stderr.includes('have cwd inside workspace')) {
+    return 'Other processes have their working directory inside the workspace. ' +
+      'ws-ckpt cannot proceed because the symlink swap would break those processes. ' +
+      'This is NOT retryable. The user must move affected processes out of the workspace.';
+  }
+  if (stderr.includes('daemon is not running') || stderr.includes('daemon is starting up')) {
+    return 'ws-ckpt daemon is not responding. Is it running?';
+  }
   if (stderr.includes('not found') && stderr.toLowerCase().includes('snapshot')) {
     return `Snapshot '${context?.id ?? 'unknown'}' not found. Use ws-ckpt-list to view available snapshots.`;
   }
@@ -202,24 +216,26 @@ export class BtrfsManager {
   }
 
   /**
-   * Roll back the workspace to a specified checkpoint.
+   * Roll back the workspace to a specified checkpoint or N ancestors back.
    *
-   * @param target - Snapshot identifier (e.g. "msg1-step2") or name.
+   * @param target       - Snapshot identifier (mutually exclusive with numAncestors).
+   * @param numAncestors - Number of ancestors to traverse (mutually exclusive with target).
    * @returns A {@link RollbackResult} describing the outcome.
    */
-  public async rollback(target: string): Promise<RollbackResult> {
+  public async rollback(target?: string, numAncestors?: number): Promise<RollbackResult> {
     if (!this.workspacePath) {
       return { success: false, message: "Workspace not initialized" };
     }
 
+    const label = target || `ancestors=${numAncestors}`;
     try {
-      const output = await this.executor.rollback(this.workspacePath, target);
+      const output = await this.executor.rollback(this.workspacePath, target, numAncestors);
 
       if (output.exitCode !== 0) {
         return {
           success: false,
           target,
-          message: mapErrorToLLMMessage(output.stderr, { id: target }),
+          message: mapErrorToLLMMessage(output.stderr, { id: label }),
         };
       }
 
@@ -232,11 +248,8 @@ export class BtrfsManager {
         }
       } catch { /* ignore refresh errors */ }
 
-      return {
-        success: true,
-        target,
-        message: `Rolled back to ${target}`,
-      };
+      const desc = target ? `Rolled back to ${target}` : `Rolled back ${numAncestors} ancestor(s)`;
+      return { success: true, target, message: desc };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       return { success: false, target, message: `Rollback error: ${msg}` };
@@ -279,7 +292,7 @@ export class BtrfsManager {
   /**
    * Execute diff and return the raw CLI output without parsing.
    */
-  public async execDiffRaw(from: string, to: string): Promise<{ success: boolean; text: string }> {
+  public async execDiffRaw(from: string, to?: string): Promise<{ success: boolean; text: string }> {
     if (!this.workspacePath) {
       return { success: false, text: "Workspace not initialized" };
     }
@@ -289,7 +302,8 @@ export class BtrfsManager {
         return { success: false, text: mapErrorToLLMMessage(output.stderr) };
       }
       const stdout = output.stdout.replace(/\x1b\[[0-9;]*m/g, '').trim();
-      return { success: true, text: stdout || `No changes between ${from} and ${to}.` };
+      const target = to ?? "current workspace";
+      return { success: true, text: stdout || `No changes between ${from} and ${target}.` };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       return { success: false, text: `Diff error: ${msg}` };

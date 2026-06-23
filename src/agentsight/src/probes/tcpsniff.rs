@@ -16,16 +16,20 @@
 use crate::config::{self, TcpTarget};
 use anyhow::{Context, Result};
 use libbpf_rs::{
-    Link, MapHandle, MapFlags,
+    Link, MapFlags,
     skel::{OpenSkel, SkelBuilder},
 };
-use std::{
-    mem::MaybeUninit,
-    net::Ipv4Addr,
-    os::fd::AsFd,
-};
+use std::{mem::MaybeUninit, net::Ipv4Addr};
+
+use super::shared_maps::{MapKind, SharedMaps};
 
 // --- Generated skeleton ---
+#[allow(
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code,
+    non_snake_case
+)]
 mod bpf {
     include!(concat!(env!("OUT_DIR"), "/tcpsniff.skel.rs"));
 }
@@ -39,13 +43,17 @@ pub struct TcpSniff {
     use_old_sig: bool,
 }
 
+/// Maps tcpsniff reuses from the shared bundle. Filtering is by destination
+/// IP/port only, so it shares the ring buffer alone (no process / cgroup filter).
+const SHARED_MAPS: &[MapKind] = &[MapKind::Rb];
+
 impl TcpSniff {
     /// Build and load the BPF skeleton, selecting the correct tcp_recvmsg
     /// program variant for the running kernel.
     ///
     /// `use_old_sig`: true → load old (5.8-5.17) programs, false → new (5.18+)
     fn load_skel(
-        rb: &MapHandle,
+        shared: &SharedMaps,
         use_old_sig: bool,
     ) -> Result<(
         Box<MaybeUninit<libbpf_rs::OpenObject>>,
@@ -55,14 +63,14 @@ impl TcpSniff {
         builder.obj_builder.debug(config::verbose());
 
         let open_object = Box::new(MaybeUninit::<libbpf_rs::OpenObject>::uninit());
-        let mut open_skel = builder.open().context("failed to open tcpsniff BPF object")?;
+        let mut open_skel = builder
+            .open()
+            .context("failed to open tcpsniff BPF object")?;
 
-        // Reuse the shared ring buffer
-        open_skel
-            .maps_mut()
-            .rb()
-            .reuse_fd(rb.as_fd())
-            .context("failed to reuse rb map for tcpsniff")?;
+        // Reuse the shared ring buffer.
+        shared
+            .reuse_into(SHARED_MAPS, open_skel.open_object_mut())
+            .context("failed to reuse shared maps for tcpsniff")?;
 
         // Selectively enable programs:
         // tcp_sendmsg fentry: always enabled (signature unchanged across kernels)
@@ -93,7 +101,9 @@ impl TcpSniff {
                 .context("failed to disable old recvmsg fexit")?;
         }
 
-        let skel = open_skel.load().context("failed to load tcpsniff BPF object")?;
+        let skel = open_skel
+            .load()
+            .context("failed to load tcpsniff BPF object")?;
 
         // SAFETY: skel borrows open_object which lives in a Box<MaybeUninit>
         let skel =
@@ -105,19 +115,18 @@ impl TcpSniff {
     /// Create a new TcpSniff that reuses the shared ring buffer map.
     /// Automatically detects the tcp_recvmsg signature for the running kernel.
     /// Does NOT require traced_processes — filtering is by destination IP/port only.
-    pub fn new_with_maps(rb: &MapHandle) -> Result<Self> {
+    pub fn new_with_shared(shared: &SharedMaps) -> Result<Self> {
         // Try new signature first (5.18+), fall back to old (5.8-5.17) on load failure
-        let (open_object, skel, use_old_sig) = match Self::load_skel(rb, false) {
+        let (open_object, skel, use_old_sig) = match Self::load_skel(shared, false) {
             Ok((obj, skel)) => {
                 log::info!("TcpSniff: loaded with new tcp_recvmsg signature (5.18+)");
                 (obj, skel, false)
             }
             Err(e) => {
                 log::info!(
-                    "TcpSniff: new tcp_recvmsg signature failed ({}), trying old (5.8-5.17)",
-                    e
+                    "TcpSniff: new tcp_recvmsg signature failed ({e}), trying old (5.8-5.17)"
                 );
-                let (obj, skel) = Self::load_skel(rb, true)
+                let (obj, skel) = Self::load_skel(shared, true)
                     .context("failed to load tcpsniff with old tcp_recvmsg signature")?;
                 log::info!("TcpSniff: loaded with old tcp_recvmsg signature (5.8-5.17)");
                 (obj, skel, true)
@@ -133,7 +142,7 @@ impl TcpSniff {
     }
 
     /// Populate the BPF tcp_targets map with the given targets.
-    /// Must be called after new_with_maps() and before attach().
+    /// Must be called after new_with_shared() and before attach().
     ///
     /// Key layout (8 bytes): ip (4 bytes BE) | port (2 bytes BE) | pad (2 bytes zero)
     pub fn set_targets(&mut self, targets: &[TcpTarget]) -> Result<()> {
@@ -141,6 +150,7 @@ impl TcpSniff {
         let map = binding.tcp_targets();
         let dummy: u8 = 1;
 
+        let mut wildcard_all = false;
         for target in targets {
             let ip_be: u32 = match target.ip {
                 Some(Ipv4Addr::UNSPECIFIED) | None => 0u32,
@@ -150,6 +160,9 @@ impl TcpSniff {
                 None => 0u16,
                 Some(p) => p.to_be(),
             };
+            if ip_be == 0 && port_be == 0 {
+                wildcard_all = true;
+            }
             // Serialize key as [ip_be(4)] [port_be(2)] [pad(2)]
             let mut key = [0u8; 8];
             key[0..4].copy_from_slice(&ip_be.to_ne_bytes());
@@ -157,9 +170,16 @@ impl TcpSniff {
             // key[6..8] = 0 (pad)
 
             map.update(&key, &[dummy], MapFlags::ANY)
-                .with_context(|| format!("failed to add target {:?} to tcp_targets map", target))?;
+                .with_context(|| format!("failed to add target {target:?} to tcp_targets map"))?;
         }
 
+        if wildcard_all {
+            log::warn!(
+                "TcpSniff: full wildcard target (any IP, any port) configured — \
+                 ALL outgoing TCP traffic will be captured. This has noticeable overhead; \
+                 prefer narrowing by IP/port for production use."
+            );
+        }
         log::info!(
             "TcpSniff: configured {} target(s): {:?}",
             targets.len(),
@@ -186,9 +206,9 @@ impl TcpSniff {
         key[4..6].copy_from_slice(&port_be.to_ne_bytes());
 
         map.update(&key, &[dummy], MapFlags::ANY)
-            .with_context(|| format!("failed to add target {:?} to tcp_targets map", target))?;
+            .with_context(|| format!("failed to add target {target:?} to tcp_targets map"))?;
 
-        log::info!("TcpSniff: added runtime target {:?}", target);
+        log::info!("TcpSniff: added runtime target {target:?}");
         Ok(())
     }
 
@@ -244,8 +264,7 @@ impl TcpSniff {
         let n = links.len();
         self._links = links;
         log::info!(
-            "TcpSniff: attached {} BPF programs (tcp_sendmsg fentry, tcp_recvmsg fentry+fexit)",
-            n
+            "TcpSniff: attached {n} BPF programs (tcp_sendmsg fentry, tcp_recvmsg fentry+fexit)"
         );
         Ok(())
     }

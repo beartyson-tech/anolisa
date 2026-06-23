@@ -6,19 +6,10 @@ static CODE_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"```[\s\S]*
 static INLINE_CODE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`[^`]+`").unwrap());
 static WHITESPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 
-/// Find a valid UTF-8 char boundary at or before `pos`.
-/// Equivalent to `str::floor_char_boundary` (stabilized in 1.89).
-fn find_char_boundary(s: &str, pos: usize) -> usize {
-    let pos = pos.min(s.len());
-    if s.is_char_boundary(pos) {
-        pos
-    } else {
-        let mut i = pos;
-        while i > 0 && !s.is_char_boundary(i) {
-            i -= 1;
-        }
-        i
-    }
+/// Convert a character count `n` to a byte offset in `s`. Returns `s.len()`
+/// when `n` exceeds the number of characters.
+fn char_index(s: &str, n: usize) -> usize {
+    s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len())
 }
 
 /// SchemaCompressor compresses OpenAI Function Calling schema
@@ -30,6 +21,7 @@ pub struct SchemaCompressor {
     drop_examples: bool,
     drop_titles: bool,
     drop_markdown: bool,
+    max_depth: usize,
 }
 
 impl Default for SchemaCompressor {
@@ -40,6 +32,15 @@ impl Default for SchemaCompressor {
             drop_examples: true,
             drop_titles: true,
             drop_markdown: true,
+            // Bound recursion to keep deeply-nested or pathological schemas
+            // (e.g. attacker-crafted ~1000-level JSON) from blowing the stack.
+            // Schemas tolerate more depth than runtime responses because
+            // OpenAPI/JSON-Schema definitions legitimately stack anyOf /
+            // oneOf / allOf branches several layers deep — 8 (the
+            // ResponseCompressor default) would truncate real-world tool
+            // descriptions. 32 keeps a wide safety margin below the
+            // ~1024-frame default stack while leaving real schemas intact.
+            max_depth: 32,
         }
     }
 }
@@ -77,6 +78,12 @@ impl SchemaCompressor {
     /// Set whether to drop markdown formatting from descriptions
     pub fn with_drop_markdown(mut self, drop: bool) -> Self {
         self.drop_markdown = drop;
+        self
+    }
+
+    /// Set the maximum recursion depth for nested schemas
+    pub fn with_max_depth(mut self, depth: usize) -> Self {
+        self.max_depth = depth;
         self
     }
 
@@ -144,6 +151,16 @@ impl SchemaCompressor {
 
     /// Recursively compress a JSON Schema
     pub fn compress_json_schema(&self, schema: &mut Value, depth: usize) {
+        // Stack-overflow guard for pathological schemas. Beyond max_depth we
+        // stop descending — the deepest nodes keep their original shape, which
+        // is acceptable since this path is best-effort token reduction.
+        // Use `>` (not `>=`) so the threshold matches response_compressor.rs
+        // semantics: a node at depth==max_depth is still processed, only its
+        // grandchildren (depth+1 > max_depth) are skipped.
+        if depth > self.max_depth {
+            return;
+        }
+
         let Some(obj) = schema.as_object_mut() else {
             return;
         };
@@ -238,10 +255,14 @@ impl SchemaCompressor {
         }
 
         // Try to find a sentence boundary in the range [max_len*0.5, max_len]
-        // floor_char_boundary is unstable before 1.89; use inline fallback
+        // Convert char counts to byte positions via char_index so the search
+        // range and hard-truncation fallback use correct byte offsets even for
+        // multi-byte text (CJK, emoji, etc.). Previously max_len was passed
+        // directly as a byte position, truncating CJK text far more
+        // aggressively than expected (e.g. 300 chars cut to ~85 instead of 256).
         let min_target = (max_len as f64 * 0.5) as usize;
-        let min_pos = find_char_boundary(&text, min_target);
-        let max_pos = find_char_boundary(&text, max_len.min(text.len()));
+        let min_pos = char_index(&text, min_target);
+        let max_pos = char_index(&text, max_len.min(text.chars().count()));
         let search_range = &text[min_pos..max_pos];
 
         // Look for sentence endings: . 。 ！ ？
@@ -259,13 +280,8 @@ impl SchemaCompressor {
             return text[..pos].trim().to_string();
         }
 
-        // No sentence boundary found, hard truncate
-        // Handle UTF-8 properly by finding char boundary
-        let mut truncate_pos = max_len;
-        while !text.is_char_boundary(truncate_pos) && truncate_pos > 0 {
-            truncate_pos -= 1;
-        }
-
+        // No sentence boundary found, hard truncate at max_len characters
+        let truncate_pos = char_index(&text, max_len);
         text[..truncate_pos].trim().to_string()
     }
 }
@@ -547,6 +563,38 @@ mod tests {
                 .get("title")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn max_depth_stops_recursion() {
+        // Build a 100-level schema and verify with_max_depth bounds the
+        // recursive descent — descriptions below the limit must be left
+        // untouched, descriptions above must be truncated.
+        let compressor = SchemaCompressor::new().with_max_depth(5);
+        let long_desc = "x".repeat(400);
+        let mut schema = json!({
+            "type": "string",
+            "description": long_desc.clone(),
+        });
+        for _ in 0..100 {
+            schema = json!({
+                "type": "object",
+                "description": long_desc.clone(),
+                "properties": {"nested": schema},
+            });
+        }
+        let result = compressor.compress(&schema);
+        // Top-level description (depth 0) must be truncated.
+        let top = result["description"].as_str().unwrap();
+        assert!(top.chars().count() <= 256);
+        // Walk down 10 levels — well past max_depth — and confirm we still
+        // see the original 400-char description (recursion stopped early).
+        let mut node = &result;
+        for _ in 0..10 {
+            node = &node["properties"]["nested"];
+        }
+        let deep = node["description"].as_str().unwrap();
+        assert_eq!(deep.chars().count(), 400);
     }
 
     #[test]

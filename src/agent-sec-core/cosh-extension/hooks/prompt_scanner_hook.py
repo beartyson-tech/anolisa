@@ -26,7 +26,6 @@ This script is intentionally self-contained — it does NOT import any
 import json
 import subprocess
 import sys
-from pathlib import Path
 
 from trace_context import with_trace_context
 
@@ -35,68 +34,34 @@ from trace_context import with_trace_context
 _DEFAULT_MODE = "standard"
 _DEFAULT_SOURCE = "user_input"
 
-# Model cache directory — mirrors ModelManager._DEFAULT_CACHE_DIR.
-_MODEL_CACHE_DIR = Path.home() / ".cache" / "prompt_scanner" / "models"
-
-# Permanent marker: once the user has been reminded about warmup, skip
-# further ask dialogs until the model is downloaded.
-_REMINDER_MARKER_DIR = Path.home() / ".cache" / "agent-sec" / "prompt-scanner"
-_REMINDER_MARKER_FILE = _REMINDER_MARKER_DIR / "warmup-reminded"
-
 
 # -- helpers ---------------------------------------------------------------
-
-
-def _is_model_downloaded() -> bool:
-    """Check whether any local model has been downloaded.
-
-    Looks for a config.json file two levels under the cache dir
-    (i.e. <cache>/<org>/<model>/config.json), which mirrors the
-    same check used by ``ModelManager._resolve_local_model_path``.
-    """
-    if not _MODEL_CACHE_DIR.exists():
-        return False
-    return any(_MODEL_CACHE_DIR.glob("*/*/config.json"))
-
-
-def _is_warmup_reminded() -> bool:
-    """Check whether the warmup reminder has already been shown.
-
-    Once reminded, the marker file persists until the model is downloaded.
-    No TTL — this is permanent suppression.
-    """
-    return _REMINDER_MARKER_FILE.exists()
-
-
-def _mark_warmup_reminded() -> None:
-    """Write a marker file to suppress future warmup ask dialogs.
-
-    Best-effort; failures are silently ignored so that permission issues
-    never break the hook.
-    """
-    try:
-        _REMINDER_MARKER_DIR.mkdir(parents=True, exist_ok=True)
-        _REMINDER_MARKER_FILE.write_text("reminded")
-    except OSError:
-        pass
-
-
-def _cleanup_warmup_marker() -> None:
-    """Remove the warmup-reminded marker file if it exists.
-
-    Called once the model is downloaded so that the marker does not
-    accumulate indefinitely.  Best-effort; failures are silently ignored.
-    """
-    try:
-        if _REMINDER_MARKER_FILE.exists():
-            _REMINDER_MARKER_FILE.unlink()
-    except OSError:
-        pass
 
 
 def _allow() -> str:
     """Return a permissive cosh HookOutput JSON string."""
     return json.dumps({"decision": "allow"})
+
+
+def _build_detail_reason(scan_result: dict) -> str:
+    """Build a detailed reason string from scan result for security operations."""
+    threat_type = scan_result.get("threat_type", "")
+    risk_level = scan_result.get("risk_level", "unknown")
+    confidence = scan_result.get("confidence")
+
+    lines = [
+        f"[prompt-scanner] 检测到安全风险",
+        f"  攻击类型 : {threat_type or 'unknown'}",
+        f"  风险等级 : {risk_level}",
+        f"  拦截环节 : 用户输入扫描 (UserPromptSubmit)",
+    ]
+    if confidence is not None:
+        try:
+            lines.append(f"  模型置信度: {float(confidence) * 100:.1f}%")
+        except (TypeError, ValueError):
+            pass
+
+    return "\n".join(lines)
 
 
 def _format_cosh(scan_result: dict) -> str:
@@ -113,21 +78,18 @@ def _format_cosh(scan_result: dict) -> str:
     if verdict == "pass":
         return json.dumps({"decision": "allow"})
 
-    # Build reason from summary; it already contains threat type, confidence & evidence.
-    summary = scan_result.get("summary", "")
-    threat_type = scan_result.get("threat_type", "")
-    msg = f"[prompt-scanner] {summary or threat_type or 'Prompt rejected by security policy'}"
+    reason = _build_detail_reason(scan_result)
 
     if verdict == "warn":
         return json.dumps(
-            {"decision": "ask", "reason": msg},
+            {"decision": "ask", "reason": reason},
             ensure_ascii=False,
         )
     # Use "ask" to avoid blocking users outright.
     # TODO: switch to "block" once the policy is mature enough.
     if verdict == "deny":
         return json.dumps(
-            {"decision": "ask", "reason": msg},
+            {"decision": "ask", "reason": reason},
             ensure_ascii=False,
         )
     # other error or unknown verdict -> fail-open
@@ -151,34 +113,7 @@ def main() -> None:
         print(_allow())
         return
 
-    # 3. Check if the local model is available.
-    #    If not, show a one-time ask reminder, then silently allow forever.
-    #    NOTE: _mark_warmup_reminded() is called *before* we know the user's
-    #    choice (Yes/No).  This is intentional — the cosh hook API does not
-    #    provide feedback on the user's decision, so we cannot conditionally
-    #    mark.  The trade-off is acceptable: the reminder appears once, and
-    #    users who cancel can still run warmup manually.
-    if not _is_model_downloaded():
-        if _is_warmup_reminded():
-            # Already reminded — silently allow without invoking CLI.
-            print(_allow())
-            return
-        # First time — ask the user, then mark as reminded.
-        _mark_warmup_reminded()
-        warmup_msg = (
-            "[prompt-scanner] ⚠️  安全扫描组件尚未完成初始化，本次 prompt 未经安全检测。\n"
-            "需要一次性下载本地检测小模型才能启用扫描功能。\n"
-            "请在终端执行以下命令完成下载，之后无需再次操作：\n"
-            "  agent-sec-cli scan-prompt warmup\n"
-            "\n"
-            "你仍可以选择继续发送（Yes），或取消（No）后先完成下载。\n"
-            "此提醒仅出现一次。"
-        )
-        print(json.dumps({"decision": "ask", "reason": warmup_msg}, ensure_ascii=False))
-        return
-
-    # 4. Model exists — clean up stale warmup marker, then call CLI
-    _cleanup_warmup_marker()
+    # 3. Call CLI. Model download/loading is owned by the daemon.
     try:
         cmd = with_trace_context(
             [
@@ -202,23 +137,40 @@ def main() -> None:
             text=True,
             timeout=10,
         )
-    except Exception:
-        # Timeout or other error -> fail-open
+    except subprocess.TimeoutExpired as exc:
+        print(
+            f"[prompt-scanner] CLI timed out after {exc.timeout}s",
+            file=sys.stderr,
+        )
+        print(_allow())
+        return
+    except Exception as exc:
+        print(f"[prompt-scanner] CLI invocation failed: {exc}", file=sys.stderr)
         print(_allow())
         return
 
     if proc.returncode != 0:
+        stderr_tail = (proc.stderr or "").strip().splitlines()[-5:]
+        print(
+            f"[prompt-scanner] CLI exited with code {proc.returncode}:"
+            f" {'; '.join(stderr_tail)}",
+            file=sys.stderr,
+        )
         print(_allow())
         return
 
-    # 5. Parse ScanResult JSON from stdout
+    # 4. Parse ScanResult JSON from stdout
     try:
         scan_result = json.loads(proc.stdout)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError) as exc:
+        print(
+            f"[prompt-scanner] failed to parse CLI output: {exc}",
+            file=sys.stderr,
+        )
         print(_allow())
         return
 
-    # 6. Format and print cosh output
+    # 5. Format and print cosh output
     print(_format_cosh(scan_result))
 
 

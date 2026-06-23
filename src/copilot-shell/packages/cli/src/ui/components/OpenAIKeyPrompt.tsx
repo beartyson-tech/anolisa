@@ -8,6 +8,7 @@ import type React from 'react';
 import { useState } from 'react';
 import { z } from 'zod';
 import { Box, Text } from 'ink';
+import chalk from 'chalk';
 import { Colors } from '../colors.js';
 import { useKeypress } from '../hooks/useKeypress.js';
 import { t } from '../../i18n/index.js';
@@ -246,7 +247,13 @@ export function OpenAIKeyPrompt({
   const applyProvider = (pIdx: number, sIdx: number) => {
     const p = getEffectiveProvider(pIdx, sIdx);
     setBaseUrl(p.id !== 'custom' ? p.baseUrl : '');
-    setModel(p.id !== 'custom' ? p.defaultModel : '');
+    const [initP, initS] = initialIndices;
+    const isInitialProvider = pIdx === initP && sIdx === initS;
+    if (isInitialProvider && defaultModel) {
+      setModel(defaultModel);
+    } else {
+      setModel(p.id !== 'custom' ? p.defaultModel : '');
+    }
   };
 
   const handleProviderChange = (newIndex: number) => {
@@ -560,7 +567,9 @@ export function OpenAIKeyPrompt({
             <Box flexGrow={1}>
               <Text>
                 {currentField === 'apiKey' ? '> ' : '  '}
-                {maskApiKey(apiKey) || ' '}
+                {currentField === 'apiKey'
+                  ? `${maskApiKey(apiKey)}${chalk.inverse(' ')}`
+                  : maskApiKey(apiKey) || ' '}
               </Text>
             </Box>
           </Box>
@@ -592,7 +601,9 @@ export function OpenAIKeyPrompt({
             <Box flexGrow={1}>
               <Text>
                 {currentField === 'model' ? '> ' : '  '}
-                {model}
+                {currentField === 'model'
+                  ? `${model}${chalk.inverse(' ')}`
+                  : model || ' '}
               </Text>
             </Box>
           </Box>
@@ -666,7 +677,9 @@ export function OpenAIKeyPrompt({
                 <Box flexGrow={1}>
                   <Text>
                     {currentField === 'apiKey' ? '> ' : '  '}
-                    {maskApiKey(apiKey) || ' '}
+                    {currentField === 'apiKey'
+                      ? `${maskApiKey(apiKey)}${chalk.inverse(' ')}`
+                      : maskApiKey(apiKey) || ' '}
                   </Text>
                 </Box>
               </Box>
@@ -688,7 +701,9 @@ export function OpenAIKeyPrompt({
                   {isCustom ? (
                     <Text>
                       {currentField === 'baseUrl' ? '> ' : '  '}
-                      {baseUrl}
+                      {currentField === 'baseUrl'
+                        ? `${baseUrl}${chalk.inverse(' ')}`
+                        : baseUrl || ' '}
                     </Text>
                   ) : (
                     <Text color={Colors.Gray}>
@@ -713,7 +728,9 @@ export function OpenAIKeyPrompt({
                 <Box flexGrow={1}>
                   <Text>
                     {currentField === 'model' ? '> ' : '  '}
-                    {model}
+                    {currentField === 'model'
+                      ? `${model}${chalk.inverse(' ')}`
+                      : model || ' '}
                   </Text>
                 </Box>
               </Box>

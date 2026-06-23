@@ -13,13 +13,16 @@
  *      Response Compression strips noise → TOON eliminates JSON format overhead.
  *
  * Stats are recorded automatically by tokenless compress-response.
- * Context passing uses environment variables (TOKENLESS_AGENT_ID,
- * TOKENLESS_SESSION_ID, TOKENLESS_TOOL_USE_ID) which are inherited by
- * child processes and read by RTK's stats patch.
+ * Context is passed to subprocesses via a per-call env merge (buildEnv()) instead
+ * of mutating process.env. Note: envContext itself is a module-level singleton,
+ * so concurrent before_tool_call callbacks can still race on agentId/toolCallId.
+ * Acceptable today because OpenClaw dispatches tool calls sequentially per
+ * session; revisit if that changes.
  */
 
 import { execSync, execFileSync, spawnSync } from "child_process";
-import { existsSync, statSync } from "fs";
+import { existsSync, statSync, readFileSync } from "fs";
+import { join } from "path";
 
 // ---- Session ID mapping --------------------------------------------------------
 // OpenClaw's tool_result_persist ctx provides sessionKey ("agent:main:main")
@@ -28,10 +31,29 @@ import { existsSync, statSync } from "fs";
 
 const sessionMap: Map<string, string> = new Map();
 
-// ---- Binary availability cache ------------------------------------------------
+// ---- In-memory env context (replaces global process.env mutation) -------------
+
+const envContext: { agentId: string; sessionId: string; toolCallId: string } = {
+  agentId: "openclaw", sessionId: "", toolCallId: "",
+};
+
+function buildEnv(): Record<string, string> {
+  return {
+    ...process.env as Record<string, string>,
+    TOKENLESS_AGENT_ID: envContext.agentId,
+    TOKENLESS_SESSION_ID: envContext.sessionId,
+    TOKENLESS_TOOL_USE_ID: envContext.toolCallId,
+  };
+}
+
+// ---- Binary availability cache (with TTL for negative results) -----------------
+
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes — retry after auto-fix installs
 
 let rtkAvailable: boolean | null = null;
+let rtkCheckedAt: number | null = null;
 let tokenlessAvailable: boolean | null = null;
+let tokenlessCheckedAt: number | null = null;
 
 // Resolved absolute paths — set by check*() functions so subprocess calls
 // use the correct path even when the binary is not on PATH (e.g. RPM installs
@@ -58,8 +80,12 @@ function isExecutable(path: string): boolean {
 
 function resolveBinaryPath(name: string, ...fallbacks: string[]): string | null {
   try {
-    const result = execSync(`sh -c 'command -v ${name}'`, { encoding: "utf-8" }).trim();
-    if (result && result !== "") return result;
+    const result = spawnSync("sh", ["-c", `command -v "$1"`, "--", name], {
+      encoding: "utf-8", timeout: 2000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const output = result.stdout?.trim();
+    if (output && output !== "") return output;
   } catch { /* not on PATH */ }
   for (const fb of fallbacks) {
     if (fb && isExecutable(fb)) return fb;
@@ -68,10 +94,19 @@ function resolveBinaryPath(name: string, ...fallbacks: string[]): string | null 
 }
 
 function checkRtk(): boolean {
+  // Refresh BOTH true and false cache once stale: a binary that was
+  // present at first check can disappear (manual uninstall, FS error,
+  // overlay swap) and a previously-missing binary can be installed by
+  // auto-fix. Asymmetric TTL would either keep using a vanished path
+  // (stale true) or never re-check after install (stale false).
+  if (rtkAvailable !== null && rtkCheckedAt && (Date.now() - rtkCheckedAt > CACHE_TTL_MS)) {
+    rtkAvailable = null;
+  }
   if (rtkAvailable !== null) return rtkAvailable;
   const resolved = resolveBinaryPath("rtk", `${LIBEXEC_FALLBACK}/rtk`, `${LIB_FALLBACK}/rtk`, `${LOCAL_FALLBACK}/rtk`, `${LOCAL_LIB}/rtk`, `${LOCAL_BIN}/rtk`);
   if (resolved) { rtkPath = resolved; rtkAvailable = true; }
   else { rtkAvailable = false; }
+  rtkCheckedAt = Date.now();
   return rtkAvailable;
 }
 
@@ -87,10 +122,15 @@ function isSkillContent(message: any): boolean {
 }
 
 function checkTokenless(): boolean {
+  // Refresh BOTH true and false cache once stale (see checkRtk for rationale).
+  if (tokenlessAvailable !== null && tokenlessCheckedAt && (Date.now() - tokenlessCheckedAt > CACHE_TTL_MS)) {
+    tokenlessAvailable = null;
+  }
   if (tokenlessAvailable !== null) return tokenlessAvailable;
   const resolved = resolveBinaryPath("tokenless", TOKENLESS_FALLBACK, `${LOCAL_FALLBACK}/tokenless`, `${LOCAL_LIB}/tokenless`, `${LOCAL_BIN}/tokenless`);
   if (resolved) { tokenlessPath = resolved; tokenlessAvailable = true; }
   else { tokenlessAvailable = false; }
+  tokenlessCheckedAt = Date.now();
   return tokenlessAvailable;
 }
 
@@ -102,6 +142,7 @@ function tryRtkRewrite(command: string): string | null {
       encoding: "utf-8",
       timeout: 2000,
       stdio: ["ignore", "pipe", "pipe"],
+      env: buildEnv(),
     });
     const rewritten = result.stdout?.trim();
     // Exit code protocol (from rtk rewrite_cmd.rs):
@@ -120,20 +161,30 @@ function tryRtkRewrite(command: string): string | null {
   }
 }
 
-function tryCompressResponse(response: any, sessionId?: string, toolCallId?: string): any | null {
+function tryCompressResponse(response: any, sessionId?: string, toolCallId?: string, thresholds?: [number, number, number]): any | null {
   try {
     const input = JSON.stringify(response);
-    const args = ["compress-response", "--agent-id", "openclaw"];
+    // 3-layer dispatch: thresholds vary by tool category.
+    //   Shell/exec tools: moderate truncation (64K/128/8) — preserves 95% of real output
+    //   API/structured tools: zero-truncation (1M/64K/32) — preserve content
+    const [truncateStringsAt, truncateArraysAt, maxDepth] = thresholds ?? [1048576, 65536, 32];
+    const args = [
+      "compress-response", "--agent-id", "openclaw",
+      "--truncate-strings-at", String(truncateStringsAt),
+      "--truncate-arrays-at", String(truncateArraysAt),
+      "--max-depth", String(maxDepth),
+    ];
     if (sessionId) args.push("--session-id", sessionId);
     if (toolCallId) args.push("--tool-use-id", toolCallId);
     const result = execFileSync(tokenlessPath, args, {
       encoding: "utf-8",
       timeout: 3000,
       input,
+      env: buildEnv(),
     }).trim();
 
-    // Only return the compressed result if it differs from the input
-    if (result === input) {
+    // Only return the compressed result if it is shorter than the input
+    if (result.length >= input.length) {
       return null; // No actual compression occurred
     }
 
@@ -152,11 +203,11 @@ function tryCompressToon(response: any, sessionId?: string, toolCallId?: string)
     if (toolCallId) args.push("--tool-use-id", toolCallId);
     const toonText = execFileSync(tokenlessPath, args, {
       encoding: "utf-8",
-      timeout: 3000,
+      timeout: 1000,
       input,
+      env: buildEnv(),
     }).trim();
-    if (!toonText || toonText === input) return null;
-    if (toonText.length >= beforeChars) return null;
+    if (!toonText || toonText.length >= beforeChars) return null;
 
     const afterChars = toonText.length;
     const savingsPct = beforeChars > 0 ? Math.round(((beforeChars - afterChars) / beforeChars) * 100) : 0;
@@ -171,6 +222,7 @@ function tryEnvCheck(toolName: string): { status: string; diagnostic: string } |
     const result = execFileSync(tokenlessPath, ["env-check", "--tool", toolName, "--json"], {
       encoding: "utf-8",
       timeout: 3000,
+      env: buildEnv(),
     }).trim();
     const parsed = JSON.parse(result);
     const status: string = parsed.status || "UNKNOWN";
@@ -182,6 +234,7 @@ function tryEnvCheck(toolName: string): { status: string; diagnostic: string } |
     const fixResult = execFileSync(tokenlessPath, ["env-check", "--tool", toolName, "--fix", "--json"], {
       encoding: "utf-8",
       timeout: 10000,
+      env: buildEnv(),
     }).trim();
     const fixParsed = JSON.parse(fixResult);
     const postStatus: string = fixParsed.status || "NOT_READY";
@@ -198,11 +251,100 @@ function tryEnvCheck(toolName: string): { status: string; diagnostic: string } |
   }
 }
 
+// ---- Unified tool categorization ---------------------------------------------
+// Load tool categories from tool_categories.json (single source of truth)
+// This ensures consistency with Python hooks and tool-ready-spec.json
+
+interface Thresholds {
+  truncate_strings_at: number;
+  truncate_arrays_at: number;
+  max_depth: number;
+}
+
+interface ToolCategories {
+  layer_1_skip: { tools: string[] };
+  layer_2_shell: { tools: string[]; thresholds?: Thresholds };
+  layer_3_api: { thresholds?: Thresholds };
+}
+
+// Hardcoded fallback tool sets — used only when tool_categories.json is missing
+// or invalid. Mirrors Python hook_utils._FALLBACK_SKIP_TOOLS/_FALLBACK_SHELL_TOOLS
+// to ensure consistent behavior across adapters even without the JSON file.
+const FALLBACK_SKIP_TOOLS: string[] = [
+  "Read", "read", "read_file", "read_many_files",
+  "Glob", "glob", "list_directory",
+  "Grep", "grep", "grep_search", "search_files",
+  "Lsp", "lsp",
+  "NotebookRead", "notebook_read", "notebookread",
+];
+const FALLBACK_SHELL_TOOLS: string[] = [
+  "Bash", "bash", "Shell", "shell", "exec", "terminal",
+  "run_shell_command", "execute_command", "process",
+];
+
+function loadToolCategories(): ToolCategories {
+  const fallback: ToolCategories = {
+    layer_1_skip: { tools: FALLBACK_SKIP_TOOLS },
+    layer_2_shell: { tools: FALLBACK_SHELL_TOOLS },
+    layer_3_api: {},
+  };
+
+  try {
+    // Try multiple possible locations for tool_categories.json
+    const possiblePaths = [
+      join(import.meta.dirname, "..", "..", "common", "hooks", "tool_categories.json"),
+      join(import.meta.dirname, "common", "hooks", "tool_categories.json"),
+      "/usr/share/anolisa/adapters/tokenless/common/hooks/tool_categories.json",
+      "/usr/local/share/anolisa/adapters/tokenless/common/hooks/tool_categories.json",
+    ];
+
+    let content: string | null = null;
+    for (const path of possiblePaths) {
+      if (existsSync(path)) {
+        content = readFileSync(path, "utf-8");
+        break;
+      }
+    }
+
+    if (!content) {
+      console.warn("[tokenless] Could not find tool_categories.json, using hardcoded fallback categories");
+      return fallback;
+    }
+
+    const data = JSON.parse(content);
+
+    // Validate required structure
+    const requiredLayers = ["layer_1_skip", "layer_2_shell", "layer_3_api"];
+    for (const layer of requiredLayers) {
+      if (!(layer in data)) {
+        throw new Error(`Missing required layer: ${layer}`);
+      }
+      if (typeof data[layer] !== "object" || data[layer] === null) {
+        throw new Error(`Layer ${layer} must be an object`);
+      }
+    }
+    // layer_1 and layer_2 require a "tools" list; layer_3 is implicit
+    for (const layer of ["layer_1_skip", "layer_2_shell"]) {
+      if (!("tools" in data[layer])) {
+        throw new Error(`Layer ${layer} missing 'tools' field`);
+      }
+      if (!Array.isArray(data[layer].tools)) {
+        throw new Error(`Layer ${layer}.tools must be an array`);
+      }
+    }
+
+    return data as ToolCategories;
+  } catch (error) {
+    console.error("[tokenless] Failed to load tool_categories.json:", error);
+    return fallback;
+  }
+}
+
 // ---- Plugin entry point -------------------------------------------------------
 
 export default {
-  id: "tokenless-openclaw",
-  name: "Token-Less",
+  id: "tokenless",
+  name: "Tokenless",
   version: "1.0.0",
   description: "Unified RTK command rewriting + response/TOON compression + Tool Ready",
   register(api: any) {
@@ -211,7 +353,40 @@ export default {
   const responseCompressionEnabled = pluginConfig.response_compression_enabled !== false;
   const toonCompressionEnabled = pluginConfig.toon_compression_enabled === true;
   const toolReadyEnabled = pluginConfig.tool_ready_enabled !== false;
-  const skipTools: Set<string> = new Set((pluginConfig.skip_tools ?? ["Read", "read_file", "Glob", "list_directory", "NotebookRead"]).map((t: string) => t.toLowerCase()));
+
+  // Load unified tool categories from JSON (single source of truth)
+  const toolCategories = loadToolCategories();
+
+  // Layer 1: Skip all compression (preserve integrity for content retrieval)
+  // Use config override if provided and non-empty, otherwise use unified categories.
+  // NOTE: `??` alone is insufficient — openclaw may inject the schema default `[]`
+  // which is not nullish, so we also check `.length` to fall through to the JSON.
+  const skipTools: Set<string> = new Set(
+    (pluginConfig.skip_tools?.length ? pluginConfig.skip_tools : toolCategories.layer_1_skip.tools)
+      .map((t: string) => t.toLowerCase())
+  );
+
+  // Layer 2: Moderate truncation for shell/exec tools
+  // Use config override if provided and non-empty, otherwise use unified categories
+  const shellTools: Set<string> = new Set(
+    (pluginConfig.shell_tools?.length ? pluginConfig.shell_tools : toolCategories.layer_2_shell.tools)
+      .map((t: string) => t.toLowerCase())
+  );
+
+  // Thresholds are read from tool_categories.json (single source of truth).
+  // Hardcoded fallbacks match the JSON defaults.
+  // 64K strings: 95% of real shell output preserved (git diff ~63K, git log ~34K).
+  // 128 arrays: 95% of result sets preserved (test results, audit reports).
+  const shellThresholds: [number, number, number] = [
+    toolCategories.layer_2_shell.thresholds?.truncate_strings_at ?? 65536,
+    toolCategories.layer_2_shell.thresholds?.truncate_arrays_at ?? 128,
+    toolCategories.layer_2_shell.thresholds?.max_depth ?? 8,
+  ];
+  const apiThresholds: [number, number, number] = [
+    toolCategories.layer_3_api.thresholds?.truncate_strings_at ?? 1048576,
+    toolCategories.layer_3_api.thresholds?.truncate_arrays_at ?? 65536,
+    toolCategories.layer_3_api.thresholds?.max_depth ?? 32,
+  ];
   const verbose = pluginConfig.verbose !== false;
 
   // ---- 0. Session mapping (sessionKey → sessionId) ---------------------------
@@ -222,8 +397,7 @@ export default {
       if (event.sessionKey && event.sessionId) {
         sessionMap.set(event.sessionKey, event.sessionId);
       }
-      // Also store in env var for RTK (exec) path
-      process.env.TOKENLESS_SESSION_ID = event.sessionId;
+      envContext.sessionId = event.sessionId;
     },
   );
 
@@ -259,10 +433,10 @@ export default {
         const command = event.params?.command;
         if (typeof command !== "string") return;
 
-        // Set env vars so RTK and response compression can read agent/session/tool IDs
-        process.env.TOKENLESS_AGENT_ID = "openclaw";
-        if (ctx?.sessionId) process.env.TOKENLESS_SESSION_ID = ctx.sessionId;
-        if (ctx?.toolCallId) process.env.TOKENLESS_TOOL_USE_ID = ctx.toolCallId;
+        // Update env context for RTK and response compression
+        envContext.agentId = "openclaw";
+        if (ctx?.sessionId) envContext.sessionId = ctx.sessionId;
+        if (ctx?.toolCallId) envContext.toolCallId = ctx.toolCallId;
 
         const rewritten = tryRtkRewrite(command);
         if (!rewritten) return;
@@ -293,6 +467,10 @@ export default {
         // Skip content-retrieval tools — agent needs complete responses
         if (event.toolName && skipTools.has(event.toolName.toLowerCase())) return;
 
+        // 3-layer dispatch: determine thresholds based on tool category
+        const toolNameLower = (event.toolName ?? "").toLowerCase();
+        const thresholds = shellTools.has(toolNameLower) ? shellThresholds : apiThresholds;
+
         // Skip skill content to avoid breaking YAML frontmatter metadata.
         if (isSkillContent(event.message)) return;
 
@@ -301,11 +479,11 @@ export default {
         // Resolve sessionId with 4-level priority:
         //   1. ctx.sessionId   — direct from OpenClaw (newer versions)
         //   2. sessionMap[sessionKey] — from session_start mapping
-        //   3. TOKENLESS_SESSION_ID   — env var (set by session_start / before_tool_call)
+        //   3. envContext.sessionId — from session_start / before_tool_call
         //   4. ctx.sessionKey  — always available ("agent:main:main"), best-effort fallback
         const sessionId = ctx?.sessionId
           || (ctx?.sessionKey && sessionMap.get(ctx.sessionKey))
-          || process.env.TOKENLESS_SESSION_ID
+          || envContext.sessionId
           || ctx?.sessionKey;
 
         // Step 1: Response Compression
@@ -313,7 +491,7 @@ export default {
         let usedResponseCompression = false;
 
         if (responseCompressionEnabled) {
-          const compressed = tryCompressResponse(currentMessage, sessionId, toolCallId);
+          const compressed = tryCompressResponse(currentMessage, sessionId, toolCallId, thresholds);
           if (compressed) {
             currentMessage = compressed;
             usedResponseCompression = true;
@@ -341,7 +519,7 @@ export default {
         let totalSavingsPct: number;
 
         if (usedToon) {
-          const before = JSON.stringify(event.message).length;
+          const before = beforeJson.length;
           const after = toonText.length;
           totalSavingsPct = before > 0 ? Math.round(((before - after) / before) * 100) : 0;
           savingsLabel = usedResponseCompression
@@ -360,7 +538,7 @@ export default {
             finalMessage = toonText;
           }
         } else {
-          const before = JSON.stringify(event.message).length;
+          const before = beforeJson.length;
           const after = JSON.stringify(currentMessage).length;
           totalSavingsPct = before > 0 ? Math.round(((before - after) / before) * 100) : 0;
           savingsLabel = "response compressed";
@@ -368,7 +546,7 @@ export default {
         }
 
         if (verbose) {
-          const before = JSON.stringify(event.message).length;
+          const before = beforeJson.length;
           const after = usedToon ? toonText.length : JSON.stringify(finalMessage).length;
           console.log(
             `[tokenless:${savingsLabel}] ${event.toolName}: ${before} -> ${after} chars (${totalSavingsPct}% reduction)`,

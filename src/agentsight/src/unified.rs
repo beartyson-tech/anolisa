@@ -20,8 +20,9 @@
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::aggregator::Aggregator;
@@ -32,7 +33,7 @@ use crate::event::Event;
 use crate::ffi::{FfiEvent, FfiEventSender};
 use crate::genai::semantic::GenAISemanticEvent;
 use crate::genai::{GenAIBuilder, GenAIExporter, GenAIStore, LogtailExporter};
-use crate::interruption::{DetectorConfig, InterruptionDetector};
+use crate::interruption::{DetectorConfig, InterruptionDetector, recover_oom_events};
 use crate::parser::Parser;
 use crate::probes::{FileWatchEvent, FileWriteEvent, Probes, ProbesPoller};
 use crate::response_map::ResponseSessionMapper;
@@ -93,11 +94,18 @@ pub struct AgentSight {
     pid_agent_name_cache: HashMap<u32, String>,
     /// HTTP domain patterns from config, used for runtime DNS-based tcpsniff target addition
     http_domains: Vec<String>,
+    /// Mailbox for watcher thread to deposit a dynamically-created LogtailExporter
+    pending_logtail: Arc<Mutex<Option<Box<dyn GenAIExporter>>>>,
+    /// DeadLoop auto-kill: enabled flag
+    deadloop_kill_enabled: bool,
+    /// DeadLoop auto-kill: trigger threshold (kill after N detections)
+    deadloop_kill_after_count: usize,
 }
 
 /// GenAI events waiting for session_id resolution via ResponseSessionMapper.
 /// If the mapper lookup succeeds within the timeout, session_id metadata is updated
-/// before export. Otherwise, the events are exported with the hash-based fallback.
+/// before export. Otherwise, the events are exported with the response_id-based
+/// fallback (`SHA256("session" + first_response_id)`).
 struct PendingGenAI {
     events: Vec<GenAISemanticEvent>,
     response_id: String,
@@ -121,10 +129,10 @@ impl AgentSight {
     /// let mut sight = AgentSight::new(config)?;
     /// ```
     pub fn new(mut config: AgentsightConfig) -> Result<Self> {
-        config.apply_verbose();
-
         // Load rules from config file only when config_path is set (CLI --config)
         // FFI users provide rules via API, no config file needed.
+        let mut config_load_ok = false;
+        let mut config_load_err: Option<(PathBuf, anyhow::Error)> = None;
         if let Some(path) = config.config_path.clone() {
             let load_result = if path.exists() {
                 config.load_from_file(&path)
@@ -135,24 +143,29 @@ impl AgentSight {
                 }
             };
             match load_result {
-                Ok(()) => {
-                    log::info!(
-                        "Loaded {} cmdline rule(s), {} https rule(s), {} http target(s) from {:?}",
-                        config.cmdline_rules.len(),
-                        config.https_rules.len(),
-                        config.http_targets.len(),
-                        path
-                    );
-                }
+                Ok(()) => config_load_ok = true,
                 Err(e) => {
-                    log::warn!(
-                        "Failed to load config from {:?}: {}, using embedded defaults",
-                        path,
-                        e
-                    );
+                    config_load_err = Some((path, e));
                     config.cmdline_rules = crate::config::default_cmdline_rules();
                 }
             }
+        }
+
+        // Init logging after config file load so JSON `log_path` / `verbose` apply.
+        config.apply_verbose();
+
+        if config_load_ok {
+            if let Some(path) = config.config_path.as_ref() {
+                log::info!(
+                    "Loaded {} cmdline rule(s), {} https rule(s), {} http target(s) from {:?}",
+                    config.cmdline_rules.len(),
+                    config.https_rules.len(),
+                    config.http_targets.len(),
+                    path
+                );
+            }
+        } else if let Some((path, e)) = config_load_err {
+            log::warn!("Failed to load config from {path:?}: {e}, using embedded defaults");
         }
 
         let all_cmdline_rules = config.cmdline_rules.clone();
@@ -187,7 +200,7 @@ impl AgentSight {
                 Ok(addrs) => {
                     for addr in addrs {
                         if let std::net::IpAddr::V4(ipv4) = addr.ip() {
-                            log::info!("http domain resolve: {} → {}", domain, ipv4);
+                            log::info!("http domain resolve: {domain} → {ipv4}");
                             tcp_targets.push(crate::config::TcpTarget {
                                 ip: Some(ipv4),
                                 port: None,
@@ -196,18 +209,35 @@ impl AgentSight {
                     }
                 }
                 Err(e) => {
-                    log::warn!("http domain resolve failed for {}: {}", domain, e);
+                    log::warn!("http domain resolve failed for {domain}: {e}");
                 }
             }
         }
 
         // Create probes - agent discovery is handled by AgentScanner via ProcMon events
         let enable_udpdns = !config.https_rules.is_empty() || !http_domains.is_empty();
-        let mut probes =
-            Probes::new(&[], config.target_uid, config.enable_filewatch, enable_udpdns, &tcp_targets).context("Failed to create probes")?;
+        let mut probes = Probes::new_with_cgroup_filter(
+            &[],
+            config.target_uid,
+            config.enable_filewatch,
+            enable_udpdns,
+            &tcp_targets,
+            config.cgroup_filter_enabled,
+        )
+        .context("Failed to create probes")?;
 
         // Attach procmon for process monitoring
         probes.attach().context("Failed to attach probes")?;
+
+        // Seed cgroup_filter map with pre-configured cgroup inode IDs
+        if config.cgroup_filter_enabled && !config.cgroup_ids.is_empty() {
+            for &cg_id in &config.cgroup_ids {
+                probes
+                    .add_traced_cgroup(cg_id)
+                    .context("Failed to register cgroup_id")?;
+                log::info!("Registered cgroup_id {cg_id}");
+            }
+        }
 
         // Create scanner with all rules (allow/deny/https)
         let mut scanner = AgentScanner::from_rules(&all_cmdline_rules, &config.https_rules);
@@ -253,44 +283,103 @@ impl AgentSight {
         // Build GenAI exporters
         let mut genai_exporters: Vec<Box<dyn GenAIExporter>> = Vec::new();
         let mut genai_sqlite_store: Option<Arc<GenAISqliteStore>> = None;
+        let sls_activated = Arc::new(AtomicBool::new(false));
 
-        // When SLS_LOGTAIL_FILE is set, use Logtail file exporter only (skip local storage)
-        // — the Logtail file will be collected by iLogtail and uploaded to SLS.
-        // `config.trace_enabled` (from `traceEnabled` in agentsight.json) controls whether
-        // conversation content fields (gen_ai.input.messages / gen_ai.output.messages) are
-        // included in the uploaded records. When false, only token metadata is uploaded.
-        if let Some(exporter) = LogtailExporter::new(
-            config.encryption_public_key.as_deref(),
-            config.trace_enabled,
-        ) {
-            // SLS 模式必须能获取到 uid (owner-account-id)，否则拒绝启动
-            let uid = crate::genai::instance_id::get_owner_account_id();
-            if uid.is_empty() {
-                anyhow::bail!(
-                    "SLS Logtail exporter is enabled (SLS_LOGTAIL_FILE set) but failed to \
-                     fetch owner-account-id from ECS metadata service. \
-                     Cannot upload logs without uid. Aborting."
-                );
-            }
-            log::info!(
-                "Logtail file exporter enabled ({}), uid={}",
-                exporter.path().display(),
-                uid
-            );
-            genai_exporters.push(Box::new(exporter));
-        } else {
-            // No Logtail: use local JSONL + SQLite
-            genai_exporters.push(Box::new(GenAIStore::new(&GenAIStore::default_path())));
+        // If config has runtime.sls_logtail_path set, seed the dynamic path
+        if let Some(ref sls_path) = config.sls_logtail_path {
+            crate::genai::logtail::set_dynamic_logtail_path(sls_path);
+        }
 
+        let is_agentic_os = crate::genai::anolisa_release::is_anolisa();
+
+        // Determine if Logtail is currently enabled (env var OR dynamic config)
+        let logtail_currently_enabled = crate::genai::logtail::logtail_enabled();
+
+        if is_agentic_os {
+            // ── Anolisa OS: always register SQLite ──
             match GenAISqliteStore::new() {
                 Ok(store) => {
-                    log::info!("SQLite GenAI exporter enabled");
+                    log::info!("SQLite GenAI exporter enabled (agentic os)");
                     let store = Arc::new(store);
                     genai_sqlite_store = Some(Arc::clone(&store));
                     genai_exporters.push(Box::new(store));
                 }
                 Err(e) => {
-                    log::warn!("Failed to initialize SQLite GenAI exporter: {}", e);
+                    log::warn!("Failed to initialize SQLite GenAI exporter: {e}");
+                }
+            }
+            // If Logtail is enabled at startup, also register it (dual-write)
+            if logtail_currently_enabled {
+                if let Some(exporter) = LogtailExporter::new(
+                    config.encryption_public_key.as_deref(),
+                    config.trace_enabled,
+                ) {
+                    let uid = crate::genai::instance_id::get_owner_account_id();
+                    if uid.is_empty() {
+                        anyhow::bail!(
+                            "SLS Logtail exporter is enabled but failed to \
+                             fetch owner-account-id from ECS metadata service. \
+                             Cannot upload logs without uid. Aborting."
+                        );
+                    }
+                    log::info!(
+                        "Logtail file exporter enabled (agentic os, {}), uid={}",
+                        exporter.path().display(),
+                        uid
+                    );
+                    genai_exporters.push(Box::new(exporter));
+                    sls_activated.store(true, Ordering::SeqCst);
+                }
+            }
+        } else {
+            // ── Non-Anolisa OS: keep original mutual exclusion behavior ──
+            if logtail_currently_enabled {
+                if let Some(exporter) = LogtailExporter::new(
+                    config.encryption_public_key.as_deref(),
+                    config.trace_enabled,
+                ) {
+                    let uid = crate::genai::instance_id::get_owner_account_id();
+                    if uid.is_empty() {
+                        anyhow::bail!(
+                            "SLS Logtail exporter is enabled (SLS_LOGTAIL_FILE set) but failed to \
+                             fetch owner-account-id from ECS metadata service. \
+                             Cannot upload logs without uid. Aborting."
+                        );
+                    }
+                    log::info!(
+                        "Logtail file exporter enabled ({}), uid={}",
+                        exporter.path().display(),
+                        uid
+                    );
+                    genai_exporters.push(Box::new(exporter));
+                    sls_activated.store(true, Ordering::SeqCst);
+                }
+                // Also initialize SQLite store for detection queries + lifecycle
+                match GenAISqliteStore::new() {
+                    Ok(store) => {
+                        log::info!("SQLite GenAI store initialized (detection + lifecycle)");
+                        let store = Arc::new(store);
+                        genai_sqlite_store = Some(Arc::clone(&store));
+                        genai_exporters.push(Box::new(store));
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to initialize SQLite GenAI store: {e}");
+                    }
+                }
+            } else {
+                // No Logtail: use local JSONL + SQLite
+                genai_exporters.push(Box::new(GenAIStore::new(&GenAIStore::default_path())));
+
+                match GenAISqliteStore::new() {
+                    Ok(store) => {
+                        log::info!("SQLite GenAI exporter enabled");
+                        let store = Arc::new(store);
+                        genai_sqlite_store = Some(Arc::clone(&store));
+                        genai_exporters.push(Box::new(store));
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to initialize SQLite GenAI exporter: {e}");
+                    }
                 }
             }
         }
@@ -306,22 +395,19 @@ impl AgentSight {
 
                 match LlmTokenizer::from_file(tokenizer_path, &config_path) {
                     Ok(tokenizer) => {
-                        log::info!("Tokenizer loaded from: {:?}", tokenizer_path);
+                        log::info!("Tokenizer loaded from: {tokenizer_path:?}");
                         Analyzer::with_tokenizer(tokenizer.clone(), tokenizer)
                     }
                     Err(e) => {
                         log::warn!(
-                            "Failed to load tokenizer from {:?}: {}. Using analyzer without tokenizer.",
-                            tokenizer_path,
-                            e
+                            "Failed to load tokenizer from {tokenizer_path:?}: {e}. Using analyzer without tokenizer."
                         );
                         Analyzer::new()
                     }
                 }
             } else {
                 log::warn!(
-                    "Tokenizer file not found: {:?}. Using analyzer without tokenizer.",
-                    tokenizer_path
+                    "Tokenizer file not found: {tokenizer_path:?}. Using analyzer without tokenizer."
                 );
                 Analyzer::new()
             }
@@ -337,15 +423,21 @@ impl AgentSight {
                 .join("interruption_events.db");
             match InterruptionStore::new_with_path(&db_path) {
                 Ok(store) => {
-                    log::info!("Interruption events store initialized at {:?}", db_path);
+                    log::info!("Interruption events store initialized at {db_path:?}");
                     Some(Arc::new(store))
                 }
                 Err(e) => {
-                    log::warn!("Failed to initialize interruption store: {}", e);
+                    log::warn!("Failed to initialize interruption store: {e}");
                     None
                 }
             }
         };
+
+        // Run OOM recovery: scan dmesg for OOM kill events that occurred while
+        // AgentSight was down (e.g. if AgentSight itself was OOM-killed).
+        if let Some(ref istore) = interruption_store {
+            recover_oom_events(istore, genai_sqlite_store.as_ref(), 0);
+        }
 
         log::info!(
             "AgentSight initialized: {} existing agent(s), {} GenAI exporter(s)",
@@ -353,22 +445,30 @@ impl AgentSight {
             genai_exporters.len(),
         );
 
-        // Spawn background thread that marks stale PENDING calls as 'interrupted'.
-        // Fires every 60 seconds; any pending call older than 5 minutes is assumed lost.
+        // Shared mailbox for dynamic LogtailExporter activation
+        let pending_logtail: Arc<Mutex<Option<Box<dyn GenAIExporter>>>> =
+            Arc::new(Mutex::new(None));
+
+        // Create `running` flag early so background threads can observe shutdown.
+        let running = Arc::new(AtomicBool::new(true));
+
+        // Spawn background threads (config watcher, token-collector, stale scanner).
+        if let Some(ref cfg_path) = config.config_path {
+            crate::background::start_config_watcher(
+                cfg_path.clone(),
+                Arc::clone(&sls_activated),
+                Arc::clone(&pending_logtail),
+                config.encryption_public_key.clone(),
+                config.trace_enabled,
+                Arc::clone(&running),
+            );
+            crate::background::start_token_collector_watcher(
+                cfg_path.clone(),
+                Arc::clone(&running),
+            );
+        }
         if let Some(ref sqlite_store) = genai_sqlite_store {
-            let store_ref = Arc::clone(sqlite_store);
-            std::thread::Builder::new()
-                .name("genai-stale-scanner".to_string())
-                .spawn(move || {
-                    log::info!("GenAI stale-pending scanner started (interval=60s, timeout=300s)");
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_secs(60));
-                        if let Err(e) = store_ref.mark_interrupted_stale(300) {
-                            log::warn!("Stale-pending scan failed: {}", e);
-                        }
-                    }
-                })
-                .ok();
+            crate::background::start_stale_scanner(Arc::clone(sqlite_store), Arc::clone(&running));
         }
 
         Ok(AgentSight {
@@ -384,7 +484,7 @@ impl AgentSight {
             storage,
             scanner,
             _poller,
-            running: Arc::new(AtomicBool::new(true)),
+            running,
             event_count: 0,
             filewatch_callback: None,
             response_mapper: ResponseSessionMapper::new(),
@@ -393,6 +493,9 @@ impl AgentSight {
             last_drain_check: std::time::Instant::now(),
             pid_agent_name_cache,
             http_domains,
+            pending_logtail,
+            deadloop_kill_enabled: config.deadloop_kill_enabled,
+            deadloop_kill_after_count: config.deadloop_kill_after_count,
         })
     }
 
@@ -433,24 +536,36 @@ impl AgentSight {
 
     /// Internal helper to attach SSL probes to a process
     fn attach_process_internal(probes: &mut Probes, pid: u32, agent_name: &str) {
-        log::debug!("Attaching to pid {}, agent name: {}", pid, agent_name);
+        log::debug!("Attaching to pid {pid}, agent name: {agent_name}");
         if let Err(e) = probes.add_traced_pid(pid) {
-            log::warn!("Failed to add pid {} to traced_processes map: {}", pid, e);
+            log::warn!("Failed to add pid {pid} to traced_processes map: {e}");
         }
         if let Err(e) = probes.attach_process(pid as i32) {
-            log::error!("Failed to attach SSL probe to pid {}: {}", pid, e);
+            log::error!("Failed to attach SSL probe to pid {pid}: {e}");
         } else {
-            log::info!("Attached to agent: {} (pid={})", agent_name, pid);
+            log::info!("Attached to agent: {agent_name} (pid={pid})");
         }
     }
 
     /// Detach SSL probes from a specific agent process
     pub fn detach_process(&mut self, pid: u32, agent_name: &str) {
-        log::debug!("Detaching from pid {}, agent name: {}", pid, agent_name);
+        log::debug!("Detaching from pid {pid}, agent name: {agent_name}");
         let _ = self.probes.remove_traced_pid(pid).inspect_err(|e| {
-            log::error!("failed to delete {pid} from traced pid map: {e}");
+            log::debug!("traced pid {pid} already removed from BPF map (expected race with sched_process_exit): {e}");
         });
         self.probes.detach_ssl_probes(pid);
+    }
+
+    /// Add a cgroup inode id to the shared BPF cgroup_filter map at runtime.
+    /// Delegates to the underlying `Probes` instance.
+    pub fn add_traced_cgroup(&mut self, cgroup_id: u64) -> anyhow::Result<()> {
+        self.probes.add_traced_cgroup(cgroup_id)
+    }
+
+    /// Remove a cgroup inode id from the shared BPF cgroup_filter map at runtime.
+    /// Delegates to the underlying `Probes` instance.
+    pub fn remove_traced_cgroup(&mut self, cgroup_id: u64) -> anyhow::Result<()> {
+        self.probes.remove_traced_cgroup(cgroup_id)
     }
 
     /// Try to receive and process the next event (non-blocking)
@@ -463,7 +578,7 @@ impl AgentSight {
         let event = self.probes.try_recv()?;
         self.event_count += 1;
 
-        log::debug!("Processing event: {:?}", event.event_type());
+        log::trace!("Processing event: {:?}", event.event_type());
 
         // Handle ProcMon events for agent lifecycle tracking
         if let Event::ProcMon(ref procmon_event) = event {
@@ -515,14 +630,15 @@ impl AgentSight {
                             if let std::net::IpAddr::V4(ipv4) = addr.ip() {
                                 log::info!(
                                     "[UDP-DNS] Adding http target {} → {}",
-                                    dns_event.domain, ipv4
+                                    dns_event.domain,
+                                    ipv4
                                 );
                                 let target = crate::config::TcpTarget {
                                     ip: Some(ipv4),
                                     port: None,
                                 };
                                 if let Err(e) = self.probes.add_tcp_target(&target) {
-                                    log::warn!("[UDP-DNS] Failed to add tcp target {}: {}", ipv4, e);
+                                    log::warn!("[UDP-DNS] Failed to add tcp target {ipv4}: {e}");
                                 }
                             }
                         }
@@ -530,7 +646,8 @@ impl AgentSight {
                     Err(e) => {
                         log::warn!(
                             "[UDP-DNS] DNS resolve failed for http domain {}: {}",
-                            dns_event.domain, e
+                            dns_event.domain,
+                            e
                         );
                     }
                 }
@@ -560,18 +677,39 @@ impl AgentSight {
             for ar in &mut analysis_results {
                 if let crate::analyzer::AnalysisResult::Token(t) = ar {
                     if t.agent.is_none() {
-                        t.agent = self.pid_agent_name_cache.get(&t.pid).cloned()
+                        t.agent = self
+                            .pid_agent_name_cache
+                            .get(&t.pid)
+                            .cloned()
                             .or_else(|| Some(t.comm.clone()));
                     }
                 }
             }
 
             if !output.events.is_empty() {
-                if output.pending_response_id.is_some() {
-                    // Session_id not yet resolved — queue for deferred resolution
+                if let Some(pending_resp_id) = output.pending_response_id {
+                    // Session_id not yet resolved — queue for deferred resolution.
+                    // Write a pending row NOW so crash detection can see this call
+                    // during the deferral window (up to PENDING_SESSION_TIMEOUT).
+                    if let Some(ref info) = pending_info {
+                        if let Some(sqlite_store) = self.genai_sqlite_store.as_ref() {
+                            if let Err(e) = sqlite_store.insert_pending(info) {
+                                log::warn!(
+                                    "Failed to insert deferred pending call {}: {}",
+                                    info.call_id,
+                                    e
+                                );
+                            }
+                        }
+                    } else {
+                        log::warn!(
+                            "Deferred GenAI call queued without pending_info (response_id={}), crash detection blind spot remains",
+                            pending_resp_id
+                        );
+                    }
                     self.pending_genai.push(PendingGenAI {
                         events: output.events,
-                        response_id: output.pending_response_id.unwrap(),
+                        response_id: pending_resp_id,
                         created_at: std::time::Instant::now(),
                     });
                     log::debug!("GenAI events queued for deferred session_id resolution");
@@ -586,7 +724,7 @@ impl AgentSight {
                             }
                             for event in &output.events {
                                 if let Err(e) = sqlite_store.complete_pending(event) {
-                                    log::warn!("Failed to complete pending call: {}", e);
+                                    log::warn!("Failed to complete pending call: {e}");
                                 }
                             }
                             // Export to non-SQLite exporters only (SQLite already written)
@@ -631,7 +769,7 @@ impl AgentSight {
             if self.ffi_sender.is_none() {
                 for analysis_result in &analysis_results {
                     if let Err(e) = self.storage.store(analysis_result) {
-                        log::warn!("Failed to store analysis result: {}", e);
+                        log::warn!("Failed to store analysis result: {e}");
                     } else {
                         log::debug!("Analysis result saved");
                     }
@@ -650,14 +788,11 @@ impl AgentSight {
             ProcMonEvent::Exec { pid, comm, .. } => {
                 // Read cmdline for deny-check and custom matching
                 let cmdline_args =
-                    crate::discovery::scanner::read_cmdline(&format!("/proc/{}/cmdline", pid));
+                    crate::discovery::scanner::read_cmdline(&format!("/proc/{pid}/cmdline"));
 
                 // Phase 1: check deny rules first (blacklist overrides everything)
                 if self.scanner.is_denied(&cmdline_args) {
-                    log::debug!(
-                        "ProcMon: pid={} denied by cmdline rule, skipping attach",
-                        pid
-                    );
+                    log::debug!("ProcMon: pid={pid} denied by cmdline rule, skipping attach");
                     return;
                 }
 
@@ -673,6 +808,7 @@ impl AgentSight {
                 if let Some(agent) = self.scanner.on_process_exit(*pid) {
                     let agent_name = agent.agent_info.name.clone();
                     self.detach_process(*pid, &agent_name);
+                    self.handle_agent_crash_detection(*pid, &agent_name);
                 }
             }
         }
@@ -712,12 +848,14 @@ impl AgentSight {
         // Main event loop
         while self.running.load(Ordering::SeqCst) {
             if let Some(result) = self.try_process() {
-                log::trace!("[Event {}] Processed", result);
+                log::trace!("[Event {result}] Processed");
             } else {
                 // No event available — flush any timed-out pending GenAI events
                 self.flush_expired_pending_genai();
                 // Drain orphaned connections from dead PIDs and persist as pending
                 self.drain_and_persist_dead_connections();
+                // Check if config watcher deposited a new LogtailExporter
+                self.check_pending_logtail();
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
@@ -733,12 +871,34 @@ impl AgentSight {
         self.running.store(false, Ordering::SeqCst);
         // Flush all pending GenAI events before exit
         self.flush_all_pending_genai();
-        // poller will be dropped automatically when AgentSight is dropped
+        // Checkpoint genai_events.db WAL so -wal/-shm are cleaned up on exit
+        // (mirrors Storage::Drop which checkpoints agentsight.db).
+        if let Some(ref store) = self.genai_sqlite_store {
+            if let Err(e) = store.wal_checkpoint() {
+                log::warn!("GenAI WAL checkpoint on shutdown failed: {e}");
+            }
+        }
+    }
+
+    /// Check and drain the pending_logtail mailbox.
+    /// If the config watcher deposited a new LogtailExporter, register it.
+    fn check_pending_logtail(&mut self) {
+        if let Ok(mut guard) = self.pending_logtail.try_lock() {
+            if let Some(exporter) = guard.take() {
+                log::info!(
+                    "Registering dynamically-activated LogtailExporter: '{}'",
+                    exporter.name()
+                );
+                self.genai_exporters.push(exporter);
+            }
+        }
     }
 
     /// Install an FFI event sender for C API mode.
     /// When set, completed events are pushed through this channel.
-    pub fn set_ffi_sender(&mut self, sender: FfiEventSender) {
+    /// `pub(crate)` because `FfiEventSender` is a crate-internal type and the
+    /// only caller lives in this crate's FFI layer.
+    pub(crate) fn set_ffi_sender(&mut self, sender: FfiEventSender) {
         self.ffi_sender = Some(sender);
     }
 
@@ -764,6 +924,28 @@ impl AgentSight {
         }
     }
 
+    /// Complete deferred GenAI events: promote their pending DB rows to
+    /// 'complete', then export to non-SQLite exporters (or FFI).
+    ///
+    /// # Preconditions
+    ///
+    /// A `status='pending'` row for each event's `call_id` must already exist
+    /// in `genai_events` (written by `insert_pending` at queue time).
+    ///
+    /// This mirrors the immediate path (try_process lines 717-744) but is used
+    /// when events were queued in `pending_genai` and are now being drained.
+    /// The pending row was written by the deferred-queue entry point; this
+    /// method updates it via `complete_pending` and avoids double-writing by
+    /// skipping the SQLite exporter in the fan-out.
+    fn complete_and_export_deferred_genai(&self, events: &[GenAISemanticEvent]) {
+        complete_deferred_genai(
+            events,
+            self.genai_sqlite_store.as_ref(),
+            &self.genai_exporters,
+            self.ffi_sender.as_ref(),
+        );
+    }
+
     /// Online interruption detection: inspect exported events and persist any
     /// detected interruption records.  Also stamps the `interruption_type`
     /// column on the corresponding `genai_events` row when SQLite is in use.
@@ -776,6 +958,8 @@ impl AgentSight {
                         // Deduplicate: skip if same (conversation_id, type, error_msg)
                         // already recorded.  Same error retried N times produces only
                         // 1 interruption; different errors each get 1.
+                        // NOTE: RetryStorm detection only fires when conversation_id is Some.
+                        // When None, each error inserts a separate row (no dedup, no storm detect).
                         if let Some(ref cid) = ie.conversation_id {
                             let error_msg = llm_call.error.as_deref();
                             if istore.exists_for_conversation(cid, &ie.interruption_type, error_msg)
@@ -792,13 +976,55 @@ impl AgentSight {
                                         &llm_call.call_id,
                                         ie.interruption_type.as_str(),
                                     );
+                                    // RetryStorm: if >= 5 total calls with same error type in
+                                    // this conversation, emit critical alert
+                                    let count = sqlite.count_interruption_type_for_conversation(
+                                        cid,
+                                        ie.interruption_type.as_str(),
+                                    );
+                                    if count >= 5
+                                        && ie.interruption_type
+                                            != crate::interruption::InterruptionType::RetryStorm
+                                    {
+                                        let storm_event =
+                                            crate::interruption::InterruptionEvent::new(
+                                                crate::interruption::InterruptionType::RetryStorm,
+                                                ie.session_id.clone(),
+                                                ie.trace_id.clone(),
+                                                ie.conversation_id.clone(),
+                                                ie.call_id.clone(),
+                                                ie.pid,
+                                                ie.agent_name.clone(),
+                                                llm_call.end_timestamp_ns as i64,
+                                                Some(serde_json::json!({
+                                                    "repeated_type": ie.interruption_type.as_str(),
+                                                    "count": count,
+                                                })),
+                                            );
+                                        if !istore.exists_for_conversation(
+                                            cid,
+                                            &crate::interruption::InterruptionType::RetryStorm,
+                                            None,
+                                        ) {
+                                            let _ = istore.insert(&storm_event);
+                                            log::warn!(
+                                                "RetryStorm detected: {} × {:?} in conversation {}",
+                                                count,
+                                                ie.interruption_type,
+                                                cid
+                                            );
+                                        }
+                                    }
                                 }
                                 continue;
                             }
                         }
                         if let Err(e) = istore.insert(ie) {
-                            log::warn!("Failed to store interruption event: {}", e);
+                            log::warn!("Failed to store interruption event: {e}");
                         }
+                        // Also export to iLogtail file (no-op if SLS_LOGTAIL_FILE unset),
+                        // so the SLS index keeps interruption records co-located with LLM calls.
+                        crate::genai::logtail::export_interruption_events(std::slice::from_ref(ie));
                         // Also stamp genai_events row with interruption_type
                         if let Some(ref sqlite) = self.genai_sqlite_store {
                             let _ = sqlite.update_interruption_type(
@@ -807,6 +1033,212 @@ impl AgentSight {
                             );
                         }
                     }
+
+                    // ── Cross-call DeadLoop detection ──────────────────────────────
+                    // After single-call detection, check for repetitive patterns
+                    // across the conversation's recent calls.
+                    if let Some(ref cid) = llm_call.metadata.get("conversation_id") {
+                        // When auto-kill is enabled, allow multiple detection events
+                        // (up to kill_after_count) so the count threshold can be reached.
+                        // When disabled, deduplicate to at most one event per conversation.
+                        let existing_count = istore.count_for_conversation(
+                            cid,
+                            &crate::interruption::InterruptionType::DeadLoop,
+                        );
+                        let should_detect = if self.deadloop_kill_enabled {
+                            existing_count <= self.deadloop_kill_after_count
+                        } else {
+                            existing_count == 0
+                        };
+
+                        if should_detect {
+                            if let Some(ref sqlite) = self.genai_sqlite_store {
+                                let loop_detector = crate::interruption::LoopDetector::default();
+                                let recent = sqlite.get_recent_calls_for_conversation(
+                                    cid,
+                                    loop_detector.config.window_size,
+                                );
+                                if let Some(loop_event) = loop_detector.detect(
+                                    cid,
+                                    llm_call.metadata.get("session_id").map(|s| s.as_str()),
+                                    llm_call.agent_name.as_deref(),
+                                    Some(llm_call.pid),
+                                    llm_call.end_timestamp_ns as i64,
+                                    &recent,
+                                ) {
+                                    let _ = istore.insert(&loop_event);
+                                    crate::genai::logtail::export_interruption_events(
+                                        std::slice::from_ref(&loop_event),
+                                    );
+                                    log::warn!(
+                                        "DeadLoop detected in conversation {}: {:?}",
+                                        cid,
+                                        loop_event.detail
+                                    );
+
+                                    // ── Auto-kill 止血 ──
+                                    if self.deadloop_kill_enabled {
+                                        let new_count = existing_count + 1;
+                                        if new_count > self.deadloop_kill_after_count {
+                                            if let Some(pid) = loop_event.pid {
+                                                log::error!(
+                                                    "DeadLoop auto-kill: escalating to SIGKILL for pid {pid} (conversation={cid}, detections={new_count})"
+                                                );
+                                                let ret = unsafe { libc::kill(pid, libc::SIGKILL) };
+                                                if ret != 0 {
+                                                    let err = std::io::Error::last_os_error();
+                                                    log::error!(
+                                                        "DeadLoop auto-kill: SIGKILL failed for pid {pid}: {err}"
+                                                    );
+                                                }
+                                            }
+                                        } else if new_count == self.deadloop_kill_after_count {
+                                            if let Some(pid) = loop_event.pid {
+                                                log::error!(
+                                                    "DeadLoop auto-kill: sending SIGTERM to pid {pid} (conversation={cid}, detections={new_count})"
+                                                );
+                                                let ret = unsafe { libc::kill(pid, libc::SIGTERM) };
+                                                if ret != 0 {
+                                                    let err = std::io::Error::last_os_error();
+                                                    log::error!(
+                                                        "DeadLoop auto-kill: SIGTERM failed for pid {pid}: {err}"
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            log::warn!(
+                                                "DeadLoop auto-kill: detection {}/{} for conversation {}, waiting...",
+                                                new_count,
+                                                self.deadloop_kill_after_count,
+                                                cid
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Immediate crash detection when a tracked agent process exits.
+    ///
+    /// Called from `ProcMon::Exit` handler. Drains in-flight connections for
+    /// the PID, persists them as pending calls, then generates an `agent_crash`
+    /// interruption event if any pending calls exist.
+    fn handle_agent_crash_detection(&mut self, pid: u32, agent_name: &str) {
+        use crate::aggregator::ConnectionState;
+        use crate::interruption::{InterruptionEvent, InterruptionType, was_pid_oom_killed};
+
+        // 1. Drain in-flight connections for this PID from the aggregator
+        let drained = self.aggregator.drain_connections_for_pid(pid);
+
+        // 2. Persist drained connections as pending calls
+        for (conn_id, state) in &drained {
+            let (_state_name, request) = match state {
+                ConnectionState::RequestPending { request } => ("RequestPending", request),
+                ConnectionState::SseActive {
+                    request: Some(req), ..
+                } => ("SseActive", req),
+                _ => continue,
+            };
+
+            if let Some(pending) = self.genai_builder.build_pending_from_request(
+                request,
+                conn_id,
+                &self.pid_agent_name_cache,
+            ) {
+                if let Some(ref store) = self.genai_sqlite_store {
+                    if let Err(e) = store.insert_pending(&pending) {
+                        log::warn!("[CrashDetect] Failed to persist pending call: {e}");
+                    }
+                }
+            }
+        }
+
+        // 3. Query all pending calls for this PID (including any persisted earlier)
+        let pending_calls = if let Some(ref store) = self.genai_sqlite_store {
+            store
+                .list_pending_for_pids(&[pid as i32])
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+
+        if pending_calls.is_empty() {
+            log::debug!(
+                "[CrashDetect] Agent {agent_name} (pid={pid}) exited with no pending calls — normal shutdown",
+            );
+            return;
+        }
+
+        // 4. Generate agent_crash interruption event
+        if let Some(ref istore) = self.interruption_store {
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+
+            let is_oom = was_pid_oom_killed(pid as i32);
+
+            // Group by (session_id, conversation_id) to produce one event per conversation
+            let mut by_conv: std::collections::HashMap<
+                (Option<String>, Option<String>),
+                Vec<String>,
+            > = std::collections::HashMap::new();
+            for (call_id, session_id, _trace_id, conversation_id) in &pending_calls {
+                by_conv
+                    .entry((session_id.clone(), conversation_id.clone()))
+                    .or_default()
+                    .push(call_id.clone());
+            }
+
+            for ((session_id, conversation_id), call_ids) in &by_conv {
+                let mut detail = serde_json::json!({
+                    "pid": pid,
+                    "agent_name": agent_name,
+                    "call_ids": call_ids,
+                    "source": "trace_procmon_exit",
+                });
+                if is_oom {
+                    detail["oom"] = serde_json::json!(true);
+                }
+                let event = InterruptionEvent::new(
+                    InterruptionType::AgentCrash,
+                    session_id.clone(),
+                    None,
+                    conversation_id.clone(),
+                    None,
+                    Some(pid as i32),
+                    Some(agent_name.to_string()),
+                    now_ns,
+                    Some(detail),
+                );
+                if let Err(e) = istore.insert(&event) {
+                    log::warn!("[CrashDetect] Failed to record agent_crash for pid={pid}: {e}");
+                } else {
+                    log::info!(
+                        "[CrashDetect] Recorded agent_crash for {} (pid={}, session={:?}, conversation={:?}, {} call(s), oom={})",
+                        agent_name,
+                        pid,
+                        session_id,
+                        conversation_id,
+                        call_ids.len(),
+                        is_oom,
+                    );
+                }
+                crate::genai::logtail::export_interruption_events(std::slice::from_ref(&event));
+            }
+
+            // Mark all pending calls for this PID as interrupted
+            if let Some(ref store) = self.genai_sqlite_store {
+                let itype = if is_oom { "oom_crash" } else { "agent_crash" };
+                if let Err(e) = store.mark_pending_interrupted_for_pid(pid as i32, itype) {
+                    log::warn!(
+                        "[CrashDetect] Failed to mark pending interrupted for pid={pid}: {e}"
+                    );
                 }
             }
         }
@@ -829,15 +1261,39 @@ impl AgentSight {
         use crate::aggregator::ConnectionState;
         use crate::genai::GenAIBuilder;
 
+        // Track persisted pending calls: (pid, call_id, session_id, agent_name, conversation_id)
+        let mut persisted_pending: Vec<(
+            u32,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = Vec::new();
+
         for (conn_id, state) in drained {
             // Destructure to capture both request AND sse_events
-            let (state_name, request, sse_events) = match state {
+            let (_state_name, request, sse_events) = match state {
                 ConnectionState::RequestPending { request } => ("RequestPending", request, vec![]),
                 ConnectionState::SseActive {
                     request: Some(req),
+                    response_headers,
                     sse_events,
-                    ..
-                } => ("SseActive", req, sse_events),
+                    compressed_buffer,
+                    content_encoding,
+                } => {
+                    // A *compressed* SSE stream buffers raw bytes and only decodes at
+                    // completion. If the PID died before the stream completed (e.g.
+                    // HTTP/2, no `0\r\n\r\n` terminator), sse_events is empty and the
+                    // body — model/tokens/output — would be lost on drain. Recover it
+                    // via the same decode path as the live finalizer.
+                    let events = drained_sse_events(
+                        sse_events,
+                        compressed_buffer,
+                        content_encoding,
+                        &response_headers,
+                    );
+                    ("SseActive", req, events)
+                }
                 _ => continue,
             };
 
@@ -851,24 +1307,33 @@ impl AgentSight {
                     let pid = pending.pid;
 
                     if let Err(e) = store.insert_pending(&pending) {
-                        log::warn!("[DrainCheck] FAIL persist: {}", e);
+                        log::warn!("[DrainCheck] FAIL persist: {e}");
                         continue;
                     }
+                    // Track for OOM detection below
+                    persisted_pending.push((
+                        conn_id.pid,
+                        pending.call_id.clone(),
+                        pending.session_id.clone(),
+                        pending.agent_name.clone(),
+                        pending.conversation_id.clone(),
+                    ));
                     // ── Session ID reconciliation ──────────────────────────
-                    // The drain path computes session_id via SHA256 hash fallback,
+                    // The drain path computes session_id via the response_id
+                    // domain-separated hash fallback (`SHA256("session"+rid)`),
                     // but normal flow uses ResponseSessionMapper (agent .jsonl UUID).
                     // Look up the real session_id from completed records for the same PID.
                     match store.lookup_session_for_pid(pid) {
                         Ok(Some(ref real_session_id)) => {
                             if pending.session_id.as_deref() != Some(real_session_id.as_str()) {
                                 if let Err(e) = store.update_session_id(&call_id, real_session_id) {
-                                    log::warn!("[DrainCheck] FAIL update session_id: {}", e);
+                                    log::warn!("[DrainCheck] FAIL update session_id: {e}");
                                 }
                             }
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            log::warn!("[DrainCheck] FAIL lookup session: {}", e);
+                            log::warn!("[DrainCheck] FAIL lookup session: {e}");
                         }
                     }
 
@@ -986,7 +1451,7 @@ impl AgentSight {
                                         let mut total = 0usize;
                                         if !all_reasoning.is_empty() {
                                             let wrapped =
-                                                format!("<think>\n{}\n</think>\n\n", all_reasoning);
+                                                format!("<think>\n{all_reasoning}\n</think>\n\n");
                                             total += tokenizer.count(&wrapped).unwrap_or(0);
                                         }
                                         if !all_content.is_empty() {
@@ -1009,7 +1474,7 @@ impl AgentSight {
                                 }
                             }
                             if let Err(e) = store.enrich_pending_from_sse(&call_id, &enrichment) {
-                                log::warn!("[DrainCheck] FAIL enrich SSE: {}", e);
+                                log::warn!("[DrainCheck] FAIL enrich SSE: {e}");
                             }
                         }
                     }
@@ -1021,6 +1486,78 @@ impl AgentSight {
                     request.path,
                     request.body_len
                 );
+            }
+        }
+
+        // ── OOM detection for dead PIDs ──────────────────────────────────────
+        // After persisting pending calls for dead PIDs, check if any were OOM-killed.
+        // This runs in the trace process (every 1s) and catches OOM events much faster
+        // than the HealthChecker (30s cycle in serve process).
+        if !persisted_pending.is_empty() {
+            if let Some(ref istore) = self.interruption_store {
+                use crate::interruption::{
+                    InterruptionEvent, InterruptionType, was_pid_oom_killed,
+                };
+
+                let now_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(0);
+
+                let mut checked_pids: HashSet<u32> = HashSet::new();
+                for (pid, _call_id, session_id, agent_name, conversation_id) in &persisted_pending {
+                    if !checked_pids.insert(*pid) {
+                        continue; // already checked this PID
+                    }
+                    if was_pid_oom_killed(*pid as i32) {
+                        let call_ids: Vec<&str> = persisted_pending
+                            .iter()
+                            .filter(|(p, _, _, _, _)| *p == *pid)
+                            .map(|(_, c, _, _, _)| c.as_str())
+                            .collect();
+                        log::info!(
+                            "[DrainCheck] PID {} was OOM-killed (confirmed via dmesg), agent={}, calls={:?}",
+                            pid,
+                            agent_name.as_deref().unwrap_or("unknown"),
+                            call_ids
+                        );
+                        let detail = serde_json::json!({
+                            "pid": pid,
+                            "agent_name": agent_name,
+                            "call_ids": call_ids,
+                            "oom": true,
+                            "source": "drain+dmesg",
+                        });
+                        let event = InterruptionEvent::new(
+                            InterruptionType::AgentCrash,
+                            session_id.clone(),
+                            None,
+                            conversation_id.clone(),
+                            None,
+                            Some(*pid as i32),
+                            agent_name.clone(),
+                            now_ns,
+                            Some(detail),
+                        );
+                        if let Err(e) = istore.insert(&event) {
+                            log::warn!(
+                                "[DrainCheck] Failed to record OOM agent_crash for pid={pid}: {e}"
+                            );
+                        } else {
+                            log::info!("[DrainCheck] Recorded OOM agent_crash for pid={pid}");
+                        }
+                        // Mark all pending calls for this PID as interrupted
+                        if let Some(ref store) = self.genai_sqlite_store {
+                            if let Err(e) =
+                                store.mark_pending_interrupted_for_pid(*pid as i32, "oom_crash")
+                            {
+                                log::warn!(
+                                    "[DrainCheck] Failed to mark pending interrupted for pid={pid}: {e}"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1071,7 +1608,7 @@ impl AgentSight {
         self.pending_genai = still_pending;
 
         for events in &to_export {
-            self.export_genai_events(events);
+            self.complete_and_export_deferred_genai(events);
             self.detect_and_store_interruptions(events);
         }
     }
@@ -1102,7 +1639,7 @@ impl AgentSight {
         self.pending_genai = still_pending;
 
         for events in &to_export {
-            self.export_genai_events(events);
+            self.complete_and_export_deferred_genai(events);
             self.detect_and_store_interruptions(events);
         }
     }
@@ -1117,7 +1654,7 @@ impl AgentSight {
             );
         }
         for pending in pending_items {
-            self.export_genai_events(&pending.events);
+            self.complete_and_export_deferred_genai(&pending.events);
             self.detect_and_store_interruptions(&pending.events);
         }
     }
@@ -1197,5 +1734,396 @@ impl AgentSight {
 impl Drop for AgentSight {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+fn drained_sse_events(
+    sse_events: Vec<crate::parser::sse::ParsedSseEvent>,
+    compressed_buffer: Option<Vec<u8>>,
+    content_encoding: Option<String>,
+    response_headers: &crate::parser::http::ParsedResponse,
+) -> Vec<crate::parser::sse::ParsedSseEvent> {
+    match compressed_buffer {
+        Some(ref buf) if sse_events.is_empty() && !buf.is_empty() => {
+            let is_chunked =
+                crate::aggregator::HttpConnectionAggregator::is_chunked_response(response_headers);
+            crate::aggregator::HttpConnectionAggregator::decode_compressed_sse(
+                buf,
+                content_encoding.as_deref(),
+                is_chunked,
+                &response_headers.source_event,
+            )
+        }
+        _ => sse_events,
+    }
+}
+
+/// Complete deferred GenAI events: promote pending DB rows to 'complete',
+/// then export to non-SQLite exporters (or FFI).
+///
+/// Extracted as a free function so the persistence policy is unit-testable
+/// without constructing a full `AgentSight` instance.
+fn complete_deferred_genai(
+    events: &[GenAISemanticEvent],
+    sqlite_store: Option<&Arc<GenAISqliteStore>>,
+    exporters: &[Box<dyn GenAIExporter>],
+    ffi_sender: Option<&FfiEventSender>,
+) {
+    if let Some(store) = sqlite_store {
+        for event in events {
+            if let Err(e) = store.complete_pending(event) {
+                log::warn!("Failed to complete deferred pending call: {e}");
+            }
+        }
+        if let Some(sender) = ffi_sender {
+            for event in events {
+                if let GenAISemanticEvent::LLMCall(call) = event {
+                    sender.send(FfiEvent::Llm(call.clone()));
+                }
+            }
+        } else {
+            for exporter in exporters {
+                if exporter.name() != "sqlite" {
+                    exporter.export(events);
+                }
+            }
+        }
+    } else {
+        // No SQLite store — export to all exporters (or FFI)
+        if let Some(sender) = ffi_sender {
+            for event in events {
+                if let GenAISemanticEvent::LLMCall(call) = event {
+                    sender.send(FfiEvent::Llm(call.clone()));
+                }
+            }
+        } else {
+            for exporter in exporters {
+                exporter.export(events);
+                log::debug!(
+                    "Exported {} GenAI events via '{}'",
+                    events.len(),
+                    exporter.name()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::parser::http::ParsedResponse;
+    use crate::parser::sse::ParsedSseEvent;
+    use crate::probes::sslsniff::SslEvent;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    /// Generate a unique temp directory for each test invocation.
+    fn unique_tmp_dir(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let pid = std::process::id();
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("agentsight-tc-{pid}-{tag}-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    // ── Tests for complete_deferred_genai + complete_pending guard ──
+
+    /// Stub exporter that records exported events for assertion.
+    struct RecordingExporter {
+        name: String,
+        events: std::sync::Mutex<Vec<GenAISemanticEvent>>,
+    }
+
+    impl RecordingExporter {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                events: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl GenAIExporter for RecordingExporter {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn export(&self, events: &[GenAISemanticEvent]) {
+            self.events.lock().unwrap().extend_from_slice(events);
+        }
+    }
+
+    fn make_test_llm_call(call_id: &str) -> crate::genai::LLMCall {
+        use crate::genai::semantic::{LLMRequest, LLMResponse};
+        crate::genai::LLMCall {
+            call_id: call_id.to_string(),
+            start_timestamp_ns: 1_000_000_000,
+            end_timestamp_ns: 2_000_000_000,
+            duration_ns: 1_000_000_000,
+            provider: "openai".to_string(),
+            model: "gpt-4".to_string(),
+            request: LLMRequest {
+                messages: vec![],
+                temperature: None,
+                max_tokens: None,
+                frequency_penalty: None,
+                presence_penalty: None,
+                top_p: None,
+                top_k: None,
+                seed: None,
+                stop_sequences: None,
+                stream: false,
+                tools: None,
+                raw_body: None,
+            },
+            response: LLMResponse {
+                messages: vec![],
+                streamed: false,
+                raw_body: None,
+            },
+            token_usage: None,
+            error: None,
+            pid: 1234,
+            process_name: "test".to_string(),
+            agent_name: Some("test-agent".to_string()),
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn make_test_pending_info(call_id: &str) -> crate::storage::sqlite::genai::PendingCallInfo {
+        crate::storage::sqlite::genai::PendingCallInfo {
+            call_id: call_id.to_string(),
+            trace_id: None,
+            conversation_id: None,
+            session_id: None,
+            start_timestamp_ns: 1_000_000_000,
+            pid: 1234,
+            process_name: "test".to_string(),
+            agent_name: Some("test-agent".to_string()),
+            http_method: Some("POST".to_string()),
+            http_path: Some("/v1/chat/completions".to_string()),
+            input_messages: None,
+            system_instructions: None,
+            user_query: None,
+            is_sse: false,
+            model: Some("gpt-4".to_string()),
+            provider: Some("openai".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_complete_pending_skips_insert_when_row_already_interrupted() {
+        let dir = unique_tmp_dir("cp-interrupted");
+        let db_path = dir.join("genai_events.db");
+        let store = Arc::new(GenAISqliteStore::new_with_path(&db_path).expect("create test store"));
+
+        let info = make_test_pending_info("call-1");
+        store.insert_pending(&info).expect("insert_pending");
+
+        // Simulate crash detection marking it as interrupted
+        store
+            .mark_pending_interrupted_for_pid(1234, "agent_crash")
+            .expect("mark interrupted");
+
+        // Now complete_pending should NOT create a duplicate row
+        let event = GenAISemanticEvent::LLMCall(make_test_llm_call("call-1"));
+        store.complete_pending(&event).expect("complete_pending");
+
+        // Verify: exactly 1 row, status = interrupted (not a second 'complete' row)
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM genai_events WHERE call_id = 'call-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "should have exactly 1 row, not 2 (double-write)");
+
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM genai_events WHERE call_id = 'call-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "interrupted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_complete_pending_fallback_inserts_when_no_row_exists() {
+        let dir = unique_tmp_dir("cp-fallback");
+        let db_path = dir.join("genai_events.db");
+        let store = Arc::new(GenAISqliteStore::new_with_path(&db_path).expect("create test store"));
+
+        // No insert_pending — simulate DB restart scenario
+        let event = GenAISemanticEvent::LLMCall(make_test_llm_call("call-2"));
+        store.complete_pending(&event).expect("complete_pending");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM genai_events WHERE call_id = 'call-2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "fallback INSERT should create exactly 1 row");
+
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM genai_events WHERE call_id = 'call-2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "complete");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_complete_deferred_genai_promotes_pending_and_exports_non_sqlite() {
+        let dir = unique_tmp_dir("deferred-export");
+        let db_path = dir.join("genai_events.db");
+        let store = Arc::new(GenAISqliteStore::new_with_path(&db_path).expect("create test store"));
+
+        // Insert a pending row
+        let info = make_test_pending_info("call-3");
+        store.insert_pending(&info).expect("insert_pending");
+
+        // Build event + exporters
+        let event = GenAISemanticEvent::LLMCall(make_test_llm_call("call-3"));
+        let recorder = RecordingExporter::new("test-recorder");
+        let sqlite_exporter = RecordingExporter::new("sqlite");
+        let exporters: Vec<Box<dyn GenAIExporter>> =
+            vec![Box::new(recorder), Box::new(sqlite_exporter)];
+
+        // Call the free function
+        complete_deferred_genai(&[event], Some(&store), &exporters, None);
+
+        // DB row should be promoted to 'complete'
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM genai_events WHERE call_id = 'call-3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "complete");
+
+        // test-recorder should have received the event; sqlite exporter should NOT
+        // (We can't inspect after move, but the function skips name()=="sqlite")
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM genai_events WHERE call_id = 'call-3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "exactly 1 row (no double-write from sqlite exporter)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_complete_deferred_genai_no_sqlite_exports_to_all() {
+        let event = GenAISemanticEvent::LLMCall(make_test_llm_call("call-4"));
+        let exporters: Vec<Box<dyn GenAIExporter>> =
+            vec![Box::new(RecordingExporter::new("test-recorder"))];
+
+        complete_deferred_genai(&[event], None, &exporters, None);
+    }
+
+    fn ssl_event() -> Rc<SslEvent> {
+        Rc::new(SslEvent {
+            source: 0,
+            timestamp_ns: 0,
+            delta_ns: 0,
+            pid: 1,
+            tid: 1,
+            uid: 0,
+            len: 0,
+            rw: 0,
+            comm: String::new(),
+            buf: Vec::new(),
+            is_handshake: false,
+            ssl_ptr: 0x1,
+        })
+    }
+
+    /// A zstd-compressed, chunk-framed SSE body (the #973 shape).
+    fn chunked_zstd_sse() -> Vec<u8> {
+        let sse = b"event: message_start\ndata: {\"type\":\"message_start\"}\n\ndata: [DONE]\n\n";
+        let comp = zstd::encode_all(&sse[..], 3).unwrap();
+        let mut chunked = Vec::new();
+        chunked.extend_from_slice(format!("{:x}\r\n", comp.len()).as_bytes());
+        chunked.extend_from_slice(&comp);
+        chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+        chunked
+    }
+
+    fn chunked_zstd_response() -> ParsedResponse {
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "text/event-stream".to_string());
+        headers.insert("content-encoding".to_string(), "zstd".to_string());
+        headers.insert("transfer-encoding".to_string(), "chunked".to_string());
+        ParsedResponse {
+            version: 11,
+            status_code: 200,
+            reason: "OK".to_string(),
+            headers,
+            body_offset: 0,
+            body_len: 0,
+            source_event: ssl_event(),
+        }
+    }
+
+    #[test]
+    fn drained_sse_events_decodes_unfinalized_compressed_stream() {
+        // fix(#973): a compressed stream that died before finalizing (events empty,
+        // buffer non-empty) must be DECODED on drain, not lost. Reverting the drain
+        // decode yields an empty vec here, so this is discriminating.
+        let events = drained_sse_events(
+            vec![],
+            Some(chunked_zstd_sse()),
+            Some("zstd".to_string()),
+            &chunked_zstd_response(),
+        );
+        assert!(
+            !events.is_empty(),
+            "compressed buffer must be decoded into events on drain"
+        );
+    }
+
+    #[test]
+    fn drained_sse_events_passes_through_when_no_buffer() {
+        // Uncompressed stream: no compressed_buffer -> nothing to decode.
+        let out = drained_sse_events(vec![], None, None, &chunked_zstd_response());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn drained_sse_events_does_not_redecode_when_events_present() {
+        // Live parsing already produced events -> pass them through, don't re-decode.
+        let existing = vec![ParsedSseEvent::new(None, None, None, 0, 0, ssl_event())];
+        let n = existing.len();
+        let out = drained_sse_events(
+            existing,
+            Some(chunked_zstd_sse()),
+            Some("zstd".to_string()),
+            &chunked_zstd_response(),
+        );
+        assert_eq!(out.len(), n, "non-empty events must pass through unchanged");
     }
 }

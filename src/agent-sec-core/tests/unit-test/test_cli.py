@@ -229,6 +229,49 @@ def test_main_invalid_trace_context_exits_before_app(mock_app, monkeypatch, caps
     mock_app.assert_not_called()
 
 
+def test_main_initializes_invocation_context_and_logging_after_trace_context(
+    monkeypatch,
+):
+    calls = []
+
+    def fake_init_trace_context(trace_context):
+        calls.append(("trace", trace_context))
+
+    def fake_init_invocation_context():
+        calls.append(("invocation", None))
+
+    def fake_setup_cli_logging():
+        calls.append(("logging", None))
+
+    def fake_app():
+        calls.append(("app", None))
+
+    monkeypatch.setattr("sys.argv", ["agent-sec-cli", "scan-code"])
+    monkeypatch.setattr(
+        "agent_sec_cli.cli._init_trace_context", fake_init_trace_context
+    )
+    monkeypatch.setattr(
+        "agent_sec_cli.cli.init_invocation_context",
+        fake_init_invocation_context,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "agent_sec_cli.cli.setup_cli_logging",
+        fake_setup_cli_logging,
+        raising=False,
+    )
+    monkeypatch.setattr("agent_sec_cli.cli.app", fake_app)
+
+    main()
+
+    assert calls == [
+        ("trace", None),
+        ("invocation", None),
+        ("logging", None),
+        ("app", None),
+    ]
+
+
 def test_events_count_forwards_trace_id_filter():
     captured = {}
 
@@ -588,6 +631,26 @@ class TestScanPiiCli(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 1)
         self.assertIn("--source must be one of", result.output)
+
+    @patch("agent_sec_cli.pii_checker.cli.invoke")
+    def test_scan_pii_accepts_runtime_sources(self, mock_invoke):
+        mock_invoke.return_value = ActionResult(
+            success=True,
+            exit_code=0,
+            stdout='{"ok": true, "verdict": "pass"}',
+            data={"ok": True, "verdict": "pass", "summary": {"total": 0}},
+        )
+
+        for source in ["tool_input", "tool_output", "model_output", "observability"]:
+            with self.subTest(source=source):
+                result = self.runner.invoke(
+                    app,
+                    ["scan-pii", "--text", "hello", "--source", source],
+                )
+
+                self.assertEqual(result.exit_code, 0)
+                _, kwargs = mock_invoke.call_args
+                self.assertEqual(kwargs["source"], source)
 
     @patch("agent_sec_cli.pii_checker.cli.invoke")
     def test_scan_pii_input_default_reads_full_file(self, mock_invoke):

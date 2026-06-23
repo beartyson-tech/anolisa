@@ -2,9 +2,9 @@
 
 > LLM token optimization toolkit — Schema/Response 压缩 + 命令重写 + TOON 格式
 
-**版本**：0.4.0
-**源码**：https://code.alibaba-inc.com/Agentic-OS/Token-Less
-**RPM 源码**：https://code.alibaba-inc.com/alinux/tokenless
+**版本**：0.5.0  
+**源码**：https://code.alibaba-inc.com/Agentic-OS/Token-Less  
+**RPM 源码**：https://code.alibaba-inc.com/alinux/tokenless  
 **系统要求**：Rust 1.89+ (edition 2024), Linux (推荐 Alinux 4)
 
 ---
@@ -89,8 +89,8 @@ Token-Less/
 
 | 规则 | 名称 | 判断条件 | 处理方式 | 默认阈值 |
 |------|------|---------|---------|---------|
-| R1 | 字符串截断 | 长度 > 512 字节 | 在 UTF-8 安全边界截断，追加 `… (truncated)` | 512 字节 |
-| R2 | 数组截断 | 元素 > 16 个 | 保留前 16 个，追加 `<... N more items truncated>` | 16 个 |
+| R1 | 字符串截断 | 长度 > 4096 字节 | 在 UTF-8 安全边界截断，追加 `… (truncated)` | 4096 字节 |
+| R2 | 数组截断 | 元素 > 32 个 | 保留前 32 个，追加 `<... N more items truncated>` | 32 个 |
 | R3 | 字段删除 | key 匹配黑名单 | 整个字段移除 | 7 个字段 |
 | R4 | null 移除 | 值为 `null` | 从对象/数组中删除 | 启用 |
 | R5 | 空值移除 | 值为 `""`/`[]`/`{}` | 从对象/数组中删除 | 启用 |
@@ -417,7 +417,7 @@ RPM 包安装后，安装脚本会自动检测并配置已安装的平台。
 ```bash
 # 检查 OpenClaw 插件配置
 cat ~/.openclaw/openclaw.json | jq '.plugins.allow'
-# 应包含 "tokenless-openclaw"
+# 应包含 "tokenless"
 
 # 检查 Copilot Shell Hook 配置
 cat ~/.copilot-shell/settings.json | jq '.hooks | keys'
@@ -769,7 +769,7 @@ ls -la ~/.local/share/anolisa/adapters/tokenless/common/hooks/
 
 | 问题 | 解决方案 |
 |------|---------|
-| 插件未加载 | 检查插件路径：`~/.openclaw/plugins/tokenless-openclaw/` |
+| 插件未加载 | 检查插件路径：`~/.openclaw/plugins/tokenless/` |
 | RTK 未生效 | 确认 `rtk` 在 `$PATH` 中，检查 `rtk_enabled` 配置 |
 | 压缩未生效 | 检查 `response_compression_enabled` 配置 |
 | TOON 压缩未生效 | 检查 `toon_compression_enabled` 配置，确认 `toon` 二进制在 PATH 中 |
@@ -850,8 +850,8 @@ jq --version
 
 | 参数 | 默认值 | Builder 方法 |
 |------|-------|-------------|
-| `truncate_strings_at` | 512 | `with_truncate_strings_at(len)` |
-| `truncate_arrays_at` | 16 | `with_truncate_arrays_at(len)` |
+| `truncate_strings_at` | 4096 | `with_truncate_strings_at(len)` |
+| `truncate_arrays_at` | 32 | `with_truncate_arrays_at(len)` |
 | `drop_nulls` | true | `with_drop_nulls(bool)` |
 | `drop_empty_fields` | true | `with_drop_empty_fields(bool)` |
 | `max_depth` | 8 | `with_max_depth(depth)` |

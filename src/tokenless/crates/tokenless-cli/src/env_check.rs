@@ -11,17 +11,35 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::LazyLock;
+
+// Regex to extract the first version-like token from --version output.
+// `split_whitespace().last()` is fragile: tools like `curl` print
+// "curl 8.1.2 (x86_64-linux-gnu)" where `.last()` gives the arch suffix,
+// and `jq-1.6` has no whitespace around the version. A targeted regex
+// anchored on digit groups avoids these false matches.
+static VERSION_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(\d+\.\d+\.\d+)").unwrap());
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
 #[cfg(unix)]
 fn current_uid() -> u32 {
-    // libc::getuid is a FFI call — requires unsafe block per Rust 2024 edition rules.
+    // SAFETY: libc::getuid() is a pure syscall with no preconditions and never fails.
     unsafe { libc::getuid() }
 }
 
 #[cfg(unix)]
+/// Check whether a file path is trusted for execution or reading.
+///
+/// Verifies: system path prefix → symlink target resolution → parent directory
+/// owner/world-writable → file owner/world-writable.
+///
+/// KEEP IN SYNC with the shell equivalent in
+/// `adapters/tokenless/common/hooks/tool_ready_hook.sh` (`is_trusted_file`).
+/// Changes to trust criteria must be applied to both implementations.
+#[allow(clippy::collapsible_if)]
 fn is_trusted_path(path: &std::path::Path) -> bool {
     // System paths are always trusted
     if path.starts_with("/usr/share")
@@ -32,6 +50,11 @@ fn is_trusted_path(path: &std::path::Path) -> bool {
         return true;
     }
     // Resolve symlink target before owner/perm checks
+    let symlink_parent = if path.is_symlink() {
+        path.parent().map(|p| p.to_path_buf())
+    } else {
+        None
+    };
     let check_path = if path.is_symlink() {
         match fs::canonicalize(path) {
             Ok(resolved) => {
@@ -50,7 +73,39 @@ fn is_trusted_path(path: &std::path::Path) -> bool {
     } else {
         path.to_path_buf()
     };
-    // Use symlink_metadata to check the target's metadata (not the symlink itself)
+    // Helper: check a directory for foreign ownership or world-writable bit.
+    fn check_parent_dir(parent: &std::path::Path) -> bool {
+        let parent_meta = match fs::symlink_metadata(parent) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        let parent_uid = parent_meta.uid();
+        if parent_uid != current_uid() && parent_uid != 0 {
+            return false;
+        }
+        if parent_meta.mode() & 0o002 != 0 {
+            return false;
+        }
+        true
+    }
+    // Check the parent of the resolved target (or the file itself when not
+    // a symlink) — a world-writable directory allows TOCTOU file replacement.
+    if let Some(parent) = check_path.parent() {
+        if !check_parent_dir(parent) {
+            return false;
+        }
+    }
+    // When the path is a symlink, also check the symlink's own parent
+    // directory. If the symlink sits in a world-writable or foreign-owned
+    // directory, an attacker can replace the symlink to point at a
+    // malicious file, bypassing the target-level checks.
+    if let Some(ref sp) = symlink_parent {
+        if sp != check_path.parent().unwrap_or(std::path::Path::new("")) {
+            if !check_parent_dir(sp) {
+                return false;
+            }
+        }
+    }
     match fs::symlink_metadata(&check_path) {
         Ok(meta) => {
             let file_uid = meta.uid();
@@ -432,7 +487,7 @@ fn version_ge(installed: &str, required: &str) -> bool {
     let i_parts = parse_ver(installed);
     let r_parts = parse_ver(required);
 
-    for i in 0..3 {
+    for i in 0..i_parts.len().max(r_parts.len()) {
         let iv = i_parts.get(i).copied().unwrap_or(0);
         let rv = r_parts.get(i).copied().unwrap_or(0);
         if iv > rv {
@@ -456,8 +511,12 @@ fn check_dep(dep: &DepEntry) -> DepStatus {
             Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
         }
         _ => {
-            // PATH lookup failed — try known install paths
-            let home = super::get_home_dir();
+            // PATH lookup failed — try known install paths. Each candidate
+            // must clear is_trusted_path() before we report it as available:
+            // otherwise a spoofed $HOME / world-writable directory could let
+            // an attacker drop a malicious binary that we'd then exec when
+            // we run `--version` or any later invocation.
+            let home = crate::get_home_dir();
             let candidates = [
                 format!("/usr/libexec/anolisa/tokenless/{}", dep.binary),
                 format!("/usr/lib/anolisa/tokenless/{}", dep.binary),
@@ -468,18 +527,23 @@ fn check_dep(dep: &DepEntry) -> DepStatus {
                 .iter()
                 .find(|p| {
                     let path = std::path::Path::new(p);
-                    path.exists()
-                        && std::fs::metadata(path)
-                            .map(|m| {
-                                #[cfg(unix)]
-                                {
-                                    use std::os::unix::fs::PermissionsExt;
-                                    m.permissions().mode() & 0o111 != 0
-                                }
-                                #[cfg(not(unix))]
-                                true
-                            })
-                            .unwrap_or(false)
+                    if !path.exists() {
+                        return false;
+                    }
+                    if !is_trusted_path(path) {
+                        return false;
+                    }
+                    std::fs::metadata(path)
+                        .map(|m| {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                m.permissions().mode() & 0o111 != 0
+                            }
+                            #[cfg(not(unix))]
+                            true
+                        })
+                        .unwrap_or(false)
                 })
                 .cloned()
         }
@@ -493,14 +557,13 @@ fn check_dep(dep: &DepEntry) -> DepStatus {
                 let installed_version = match version_output {
                     Ok(out) => {
                         let stdout = String::from_utf8_lossy(&out.stdout);
-                        stdout
-                            .lines()
-                            .next()
-                            .unwrap_or("")
-                            .split_whitespace()
-                            .last()
-                            .unwrap_or("0.0.0")
-                            .to_string()
+                        // Use regex to find the first version-like token
+                        // (digits.digits.digits), not split_whitespace().last()
+                        // which fails for "curl 8.1.2 (x86_64...)" and "jq-1.6".
+                        VERSION_RE
+                            .find(&stdout)
+                            .map(|m| m.as_str().to_string())
+                            .unwrap_or_else(|| "0.0.0".to_string())
                     }
                     Err(_) => "0.0.0".to_string(),
                 };
@@ -522,9 +585,19 @@ fn check_dep(dep: &DepEntry) -> DepStatus {
 }
 
 /// Expand ~/... in paths to HOME directory.
+/// Paths that escape via traversal (`~/../../etc/passwd`) are rejected and
+/// the original path is returned unchanged. A component-based check is used
+/// instead of canonicalize so the expansion still works for config paths
+/// that have not been created yet.
 fn expand_path(path: &str) -> String {
     if path == "~" || path.starts_with("~/") {
-        let home = super::get_home_dir();
+        if std::path::Path::new(path)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return path.to_string();
+        }
+        let home = crate::get_home_dir();
         path.replacen("~", &home, 1)
     } else {
         path.to_string()
@@ -540,7 +613,7 @@ fn check_config_file(path: &str) -> bool {
 /// Check a permission type.
 fn check_permission(perm: &str) -> bool {
     match perm {
-        "file_read" => fs::read_to_string("/etc/hostname").is_ok(),
+        "file_read" => fs::read_to_string("/proc/self/status").is_ok(),
         "file_write" => {
             let test_path =
                 std::env::temp_dir().join(format!(".tokenless-ready-test-{}", std::process::id()));
@@ -963,6 +1036,21 @@ fn auto_fix(missing_deps: &[DepEntry]) -> Result<String, String> {
         .map_err(|e| format!("Failed to wait for env-fix: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Surface stderr (and stdout) so the caller can show the failure
+        // instead of silently treating an error message as a "success" payload.
+        return Err(format!(
+            "env-fix exited with {}: {}{}",
+            output.status,
+            stderr.trim(),
+            if stdout.is_empty() {
+                String::new()
+            } else {
+                format!(" | stdout: {}", stdout.trim())
+            }
+        ));
+    }
     Ok(stdout)
 }
 
@@ -1515,6 +1603,141 @@ mod tests {
         assert_eq!(shell_spec.required[2].manager, "rpm");
 
         std::fs::remove_file(&spec_path).ok();
+    }
+
+    #[cfg(unix)]
+    fn make_test_dir(label: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!(
+            "tokenless-is-trusted-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            label
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[cfg(unix)]
+    fn chmod_file(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(path).unwrap().permissions();
+        perm.set_mode(mode);
+        std::fs::set_permissions(path, perm).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_trusted_path_system_prefixes_unconditional() {
+        // The system-path branch returns early without touching the
+        // filesystem, so non-existent paths still report trusted.
+        use std::path::Path;
+        assert!(is_trusted_path(Path::new("/usr/share/anolisa/x")));
+        assert!(is_trusted_path(Path::new("/usr/libexec/anolisa/x")));
+        assert!(is_trusted_path(Path::new("/usr/lib/anolisa/x")));
+        assert!(is_trusted_path(Path::new("/usr/local/share/anolisa/x")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_trusted_path_rejects_world_writable_parent() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = make_test_dir("ww-parent");
+        if std::fs::metadata(&tmp).unwrap().uid() != current_uid() {
+            // /tmp on hardened multi-user systems may strip our ownership;
+            // the world-writable check is moot in that case.
+            std::fs::remove_dir_all(&tmp).ok();
+            return;
+        }
+        chmod_file(&tmp, 0o777);
+        let f = tmp.join("binary");
+        std::fs::write(&f, b"#!/bin/sh\n").unwrap();
+        chmod_file(&f, 0o755);
+        assert!(
+            !is_trusted_path(&f),
+            "world-writable parent dir must be rejected"
+        );
+        chmod_file(&tmp, 0o755);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_trusted_path_rejects_world_writable_file() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = make_test_dir("ww-file");
+        if std::fs::metadata(&tmp).unwrap().uid() != current_uid() {
+            std::fs::remove_dir_all(&tmp).ok();
+            return;
+        }
+        chmod_file(&tmp, 0o755);
+        let f = tmp.join("binary");
+        std::fs::write(&f, b"#!/bin/sh\n").unwrap();
+        chmod_file(&f, 0o777);
+        assert!(
+            !is_trusted_path(&f),
+            "world-writable file mode must be rejected"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_trusted_path_accepts_owned_safe_file() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = make_test_dir("ok");
+        if std::fs::metadata(&tmp).unwrap().uid() != current_uid() {
+            std::fs::remove_dir_all(&tmp).ok();
+            return;
+        }
+        chmod_file(&tmp, 0o755);
+        let f = tmp.join("binary");
+        std::fs::write(&f, b"#!/bin/sh\n").unwrap();
+        chmod_file(&f, 0o755);
+        assert!(
+            is_trusted_path(&f),
+            "uid-owned non-writable file must be accepted"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_trusted_path_rejects_nonexistent_file() {
+        let nonexistent = std::env::temp_dir().join(format!(
+            "tokenless-nonexistent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(
+            !is_trusted_path(&nonexistent),
+            "non-existent file must be rejected"
+        );
+    }
+
+    #[test]
+    fn expand_path_rejects_parent_dir_traversal() {
+        // ParentDir components in ~/... paths are rejected at the syntax
+        // layer so a misconfigured config_files entry like "~/../etc/passwd"
+        // cannot escape the home directory after expansion.
+        let escaped = expand_path("~/../etc/passwd");
+        assert_eq!(
+            escaped, "~/../etc/passwd",
+            "ParentDir-bearing tilde path must be returned unchanged"
+        );
+        let escaped2 = expand_path("~/sub/../../../etc/passwd");
+        assert_eq!(
+            escaped2, "~/sub/../../../etc/passwd",
+            "Deep ParentDir traversal must be returned unchanged"
+        );
     }
 
     #[test]

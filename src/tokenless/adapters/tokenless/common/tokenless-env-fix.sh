@@ -19,6 +19,9 @@ SUDO_PREFIX=""
 
 FIX_LOG_DIR="${HOME}/.tokenless"
 FIX_LOG="${FIX_LOG_DIR}/env-fix.log"
+# Eagerly create the log dir so 2>>"$FIX_LOG" redirects in install steps
+# below never silently drop their stderr because the directory is missing.
+mkdir -p "$FIX_LOG_DIR" 2>/dev/null || true
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPEC_FILE="${SCRIPT_DIR}/tool-ready-spec.json"
 
@@ -58,7 +61,10 @@ was_recently_fixed() {
   local cutoff
   cutoff=$(date -d '24 hours ago' +%Y-%m-%dT%H:%M:%S 2>/dev/null || date -v-24H +%Y-%m-%dT%H:%M:%S 2>/dev/null || echo "")
   if [ -z "$cutoff" ]; then return 1; fi
-  awk -v c="$cutoff" -v d="$dep" '$0 >= c && $0 ~ "fix=" d " status=success" {found=1; exit} END {exit !found}' "$FIX_LOG" 2>/dev/null
+  # Use grep -F (fixed-string, not regex) to match the exact dep name —
+  # dep names may contain '.' (e.g. "python3.11") which is a regex wildcard.
+  awk -v c="$cutoff" '$0 >= c {print}' "$FIX_LOG" 2>/dev/null \
+    | grep -Fq "fix=${dep} status=success"
 }
 
 # --- Normalize a dep spec to object format ---
@@ -100,10 +106,64 @@ validate_name() {
     echo "[tokenless-env-fix] BLOCKED: ${label} too long (${#val} chars): ${val:0:32}..."
     return 1
   fi
-  if ! echo "$val" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9._@/+-]*$'; then
+  if ! echo "$val" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9._@+-]*$'; then
     echo "[tokenless-env-fix] BLOCKED: invalid ${label}: ${val}"
     return 1
   fi
+}
+
+# is_trusted_source_path — accept system anolisa install dirs unconditionally;
+# for $HOME-relative paths, resolve home via the passwd database (NSS) instead
+# of $HOME and require uid ownership to match the current user (or root).
+# Reading $HOME directly is unsafe — a parent process can override it to
+# redirect trust evaluation toward an attacker-controlled directory.
+is_trusted_source_path() {
+  local p="$1"
+  case "$p" in
+    /usr/lib/anolisa/*|/usr/libexec/anolisa/*|/usr/share/anolisa/*|/usr/local/lib/anolisa/*|/usr/local/libexec/anolisa/*|/usr/local/share/anolisa/*)
+      return 0
+      ;;
+  esac
+
+  # Resolve the real home from the passwd database. If getent is missing
+  # (minimal containers without nsswitch), refuse to trust any $HOME-relative
+  # path rather than fall back to $HOME.
+  local real_home=""
+  if command -v getent &>/dev/null; then
+    real_home=$(getent passwd "$(id -u)" 2>/dev/null | awk -F: 'NR==1{print $6}')
+  fi
+  if [ -z "$real_home" ]; then
+    return 1
+  fi
+  case "$p" in
+    "$real_home"/.local/share/anolisa/*)
+      local owner_uid
+      # Linux uses `stat -c`, BSD/macOS uses `stat -f` — try both.
+      owner_uid=$(stat -c '%u' "$p" 2>/dev/null || stat -f '%u' "$p" 2>/dev/null || echo "")
+      if [ -z "$owner_uid" ]; then
+        return 1
+      fi
+      if [ "$owner_uid" != "$(id -u)" ] && [ "$owner_uid" != "0" ]; then
+        return 1
+      fi
+      # Check the parent directory for TOCTOU protection.
+      local _pd
+      _pd=$(dirname "$p")
+      local _pdo
+      _pdo=$(stat -c '%u' "$_pd" 2>/dev/null || stat -f '%u' "$_pd" 2>/dev/null || echo "-1")
+      if [ "$_pdo" != "$(id -u)" ] && [ "$_pdo" != "0" ]; then
+        return 1
+      fi
+      local _pdp
+      _pdp=$(stat -c '%a' "$_pd" 2>/dev/null || stat -f '%Lp' "$_pd" 2>/dev/null || echo "777")
+      local _pdop="${_pdp: -1}"
+      if (( _pdop & 2 )); then
+        return 1
+      fi
+      return 0
+      ;;
+  esac
+  return 1
 }
 
 # --- Package manager install functions ---
@@ -114,20 +174,25 @@ install_via_system() {
   local package="$1"
   # Refresh package index before first install on apt-based systems
   case "$PACKAGE_MANAGER" in
-    apt)  if [ "$_APT_UPDATED" != true ]; then $SUDO_PREFIX apt-get update -qq 2>/dev/null || log_fix "apt-get update failed (network issue?)"; _APT_UPDATED=true; fi ;;
+    apt)  if [ "$_APT_UPDATED" != true ]; then $SUDO_PREFIX apt-get update -qq 2>>"$FIX_LOG" || log_fix "apt-get-update" "failed" "network issue?"; _APT_UPDATED=true; fi ;;
   esac
-  # Try detected system manager first, then others as fallback (Alinux dnf/yum > apt > apk)
+  # Try detected system manager first, then others as fallback (Alinux dnf/yum > apt > apk).
+  # Stderr is appended to $FIX_LOG (instead of 2>/dev/null) so a chain of "all
+  # managers failed" leaves a diagnosable trail rather than a silent NOT_READY.
   case "$PACKAGE_MANAGER" in
-    dnf)  $SUDO_PREFIX dnf install -y "$package" 2>/dev/null || $SUDO_PREFIX yum install -y "$package" 2>/dev/null || $SUDO_PREFIX apt-get install -y "$package" 2>/dev/null || $SUDO_PREFIX apk add "$package" 2>/dev/null ;;
-    yum)  $SUDO_PREFIX yum install -y "$package" 2>/dev/null || $SUDO_PREFIX dnf install -y "$package" 2>/dev/null || $SUDO_PREFIX apt-get install -y "$package" 2>/dev/null || $SUDO_PREFIX apk add "$package" 2>/dev/null ;;
-    apt)  $SUDO_PREFIX apt-get install -y "$package" 2>/dev/null || $SUDO_PREFIX dnf install -y "$package" 2>/dev/null || $SUDO_PREFIX yum install -y "$package" 2>/dev/null || $SUDO_PREFIX apk add "$package" 2>/dev/null ;;
-    apk)  $SUDO_PREFIX apk add "$package" 2>/dev/null || $SUDO_PREFIX dnf install -y "$package" 2>/dev/null || $SUDO_PREFIX yum install -y "$package" 2>/dev/null || $SUDO_PREFIX apt-get install -y "$package" 2>/dev/null ;;
-    *)    $SUDO_PREFIX yum install -y "$package" 2>/dev/null || $SUDO_PREFIX dnf install -y "$package" 2>/dev/null || $SUDO_PREFIX apt-get install -y "$package" 2>/dev/null || $SUDO_PREFIX apk add "$package" 2>/dev/null ;;
+    dnf)  $SUDO_PREFIX dnf install -y "$package" 2>>"$FIX_LOG" || $SUDO_PREFIX yum install -y "$package" 2>>"$FIX_LOG" || $SUDO_PREFIX apt-get install -y "$package" 2>>"$FIX_LOG" || $SUDO_PREFIX apk add "$package" 2>>"$FIX_LOG" ;;
+    yum)  $SUDO_PREFIX yum install -y "$package" 2>>"$FIX_LOG" || $SUDO_PREFIX dnf install -y "$package" 2>>"$FIX_LOG" || $SUDO_PREFIX apt-get install -y "$package" 2>>"$FIX_LOG" || $SUDO_PREFIX apk add "$package" 2>>"$FIX_LOG" ;;
+    apt)  $SUDO_PREFIX apt-get install -y "$package" 2>>"$FIX_LOG" || $SUDO_PREFIX dnf install -y "$package" 2>>"$FIX_LOG" || $SUDO_PREFIX yum install -y "$package" 2>>"$FIX_LOG" || $SUDO_PREFIX apk add "$package" 2>>"$FIX_LOG" ;;
+    apk)  $SUDO_PREFIX apk add "$package" 2>>"$FIX_LOG" || $SUDO_PREFIX dnf install -y "$package" 2>>"$FIX_LOG" || $SUDO_PREFIX yum install -y "$package" 2>>"$FIX_LOG" || $SUDO_PREFIX apt-get install -y "$package" 2>>"$FIX_LOG" ;;
+    *)    $SUDO_PREFIX yum install -y "$package" 2>>"$FIX_LOG" || $SUDO_PREFIX dnf install -y "$package" 2>>"$FIX_LOG" || $SUDO_PREFIX apt-get install -y "$package" 2>>"$FIX_LOG" || $SUDO_PREFIX apk add "$package" 2>>"$FIX_LOG" ;;
   esac
 }
 
 install_via_rpm() {
-  $SUDO_PREFIX yum install -y "$1" 2>/dev/null || $SUDO_PREFIX dnf install -y "$1" 2>/dev/null || $SUDO_PREFIX rpm -ivh "$1" 2>/dev/null
+  # Stderr from each retry is appended to $FIX_LOG (rather than dropped via
+  # 2>/dev/null) so a chain of "all rpm frontends failed" leaves diagnosable
+  # output for the user.
+  $SUDO_PREFIX yum install -y "$1" 2>>"$FIX_LOG" || $SUDO_PREFIX dnf install -y "$1" 2>>"$FIX_LOG" || $SUDO_PREFIX rpm -ivh "$1" 2>>"$FIX_LOG"
 }
 
 install_via_pip() {
@@ -137,27 +202,31 @@ install_via_pip() {
   command -v pip3 &>/dev/null && pip_cmd="pip3" || { command -v pip &>/dev/null && pip_cmd="pip"; }
   if [ -z "$pip_cmd" ]; then return 1; fi
 
+  # Stderr from each retry is appended to $FIX_LOG (rather than discarded
+  # via 2>/dev/null) so a four-stage failure leaves diagnosable output for
+  # the user.
+
   # Stage 1: default mirror
-  $pip_cmd install "$pip_name" 2>/dev/null
+  $pip_cmd install "$pip_name" 2>>"$FIX_LOG"
   hash -r
   if command -v "$package" &>/dev/null; then return 0; fi
 
   # pip reported success but binary missing (stale metadata) — uninstall + reinstall
-  $pip_cmd uninstall -y "$pip_name" 2>/dev/null || true
-  $pip_cmd install "$pip_name" 2>/dev/null
+  $pip_cmd uninstall -y "$pip_name" 2>>"$FIX_LOG" || true
+  $pip_cmd install "$pip_name" 2>>"$FIX_LOG"
   hash -r
   if command -v "$package" &>/dev/null; then return 0; fi
 
   # Stage 2: purge cache and retry
-  $pip_cmd cache purge 2>/dev/null
-  $pip_cmd uninstall -y "$pip_name" 2>/dev/null || true
-  $pip_cmd install --no-cache-dir "$pip_name" 2>/dev/null
+  $pip_cmd cache purge 2>>"$FIX_LOG"
+  $pip_cmd uninstall -y "$pip_name" 2>>"$FIX_LOG" || true
+  $pip_cmd install --no-cache-dir "$pip_name" 2>>"$FIX_LOG"
   hash -r
   if command -v "$package" &>/dev/null; then return 0; fi
 
   # Stage 3: fallback to official PyPI (mirror may be broken/sync-lag)
-  $pip_cmd uninstall -y "$pip_name" 2>/dev/null || true
-  $pip_cmd install --no-cache-dir --index-url https://pypi.org/simple/ "$pip_name" 2>/dev/null
+  $pip_cmd uninstall -y "$pip_name" 2>>"$FIX_LOG" || true
+  $pip_cmd install --no-cache-dir --index-url https://pypi.org/simple/ "$pip_name" 2>>"$FIX_LOG"
   hash -r
   if command -v "$package" &>/dev/null; then return 0; fi
 
@@ -167,23 +236,26 @@ install_via_pip() {
 install_via_uv() {
   local package="$1"
   local uv_name="${2:-$package}"
-  uv tool install "$uv_name" 2>/dev/null || uv pip install "$uv_name" 2>/dev/null
+  # Append stderr to $FIX_LOG so install failures are diagnosable instead of
+  # silently producing a NOT_READY downstream.
+  uv tool install "$uv_name" 2>>"$FIX_LOG" || uv pip install "$uv_name" 2>>"$FIX_LOG"
 }
 
 install_via_npm() {
   local package="$1"
   local npm_name="${2:-$package}"
-  $SUDO_PREFIX npm install -g "$npm_name" 2>/dev/null
+  $SUDO_PREFIX npm install -g "$npm_name" 2>>"$FIX_LOG"
 }
 
 install_via_npx() {
-  # npx doesn't install — just verifies availability
+  # npx doesn't install — just verifies availability. Stderr suppressed
+  # because the "package not yet cached" message is normal noise here.
   local package="$1"
   npx -y "$package" --version 2>/dev/null >/dev/null
 }
 
 install_via_cargo() {
-  cargo install "$1" --locked 2>/dev/null
+  cargo install "$1" --locked 2>>"$FIX_LOG"
 }
 
 install_via_cargo_build() {
@@ -191,49 +263,105 @@ install_via_cargo_build() {
   local manifest="$1"
   local binary="$2"
   local features="${3:-}"
-  local cargo_args="--release --manifest-path $manifest"
-  if [ -n "$features" ]; then
-    cargo_args="$cargo_args --features $features"
+  if [ ! -f "$manifest" ]; then
+    echo "[tokenless-env-fix] BLOCKED: manifest not found: $manifest"
+    return 1
   fi
-  cargo build $cargo_args 2>/dev/null
-  # Find the built binary
+  # Reject untrusted manifests — building from a path the current uid does
+  # not own (or worse, from an attacker-writable $HOME path) would let an
+  # attacker bake arbitrary code into /usr/local/bin via build.rs.
+  if ! is_trusted_source_path "$manifest"; then
+    echo "[tokenless-env-fix] BLOCKED: cargo_build manifest not in trusted path or wrong owner: $manifest"
+    return 1
+  fi
+  local -a cargo_args=("--release" "--manifest-path" "$manifest")
+  if [ -n "$features" ]; then
+    cargo_args+=("--features" "$features")
+  fi
+  # Every step below must hard-fail: cargo build, the post-build binary
+  # check, and the cp/chmod install. Previously cp/chmod used
+  # `2>/dev/null || true` and the binary check was best-effort, so the
+  # function returned 0 even when nothing was installed — env-check then
+  # reported NOT_READY with no diagnostic trail. Return 1 on any failure
+  # and log stderr to $FIX_LOG so the fallback chain (or the user) has
+  # something to work with.
+  cargo build "${cargo_args[@]}" 2>>"$FIX_LOG" || return 1
   local target_dir
   target_dir=$(dirname "$manifest")/target/release
-  if [ -x "${target_dir}/${binary}" ]; then
-    $SUDO_PREFIX cp "${target_dir}/${binary}" /usr/local/bin/"${binary}" 2>/dev/null || true
-    $SUDO_PREFIX chmod +x /usr/local/bin/"${binary}" 2>/dev/null || true
+  if [ ! -x "${target_dir}/${binary}" ]; then
+    echo "[tokenless-env-fix] BLOCKED: cargo_build produced no binary at ${target_dir}/${binary}"
+    return 1
   fi
+  $SUDO_PREFIX cp "${target_dir}/${binary}" /usr/local/bin/"${binary}" 2>>"$FIX_LOG" || return 1
+  $SUDO_PREFIX chmod +x /usr/local/bin/"${binary}" 2>>"$FIX_LOG" || return 1
 }
 
 install_via_symlink() {
   local binary="$1"
   local source="$2"
-  # Only allow symlinks from trusted installation directories
-  case "$source" in
-    /usr/lib/anolisa/*|/usr/libexec/anolisa/*|/usr/share/anolisa/*|/usr/local/lib/anolisa/*|/usr/local/libexec/anolisa/*|/usr/local/share/anolisa/*)
-      ;;
-    "$HOME"/.local/share/anolisa/*)
-      ;;
-    *)
-      echo "[tokenless-env-fix] BLOCKED: symlink source not in trusted path: $source"
-      return 1
-      ;;
-  esac
   if [ ! -f "$source" ]; then
     echo "[tokenless-env-fix] BLOCKED: symlink source does not exist: $source"
     return 1
   fi
-  $SUDO_PREFIX ln -sf "$source" /usr/local/bin/"$binary" 2>/dev/null || true
-  chmod +x "$source" 2>/dev/null || true
+  # Reject sources outside the trusted prefix list, and require uid
+  # ownership to match the current user (or root) for any $HOME path —
+  # $HOME is env-controllable, so a plain path whitelist is not enough.
+  if ! is_trusted_source_path "$source"; then
+    echo "[tokenless-env-fix] BLOCKED: symlink source not in trusted path or wrong owner: $source"
+    return 1
+  fi
+  # Hard-fail on ln/chmod errors (formerly `|| true`, which caused
+  # install_via_symlink to report success even when the symlink wasn't
+  # actually created — env-check then reported NOT_READY with no trail).
+  $SUDO_PREFIX ln -sf "$source" /usr/local/bin/"$binary" 2>>"$FIX_LOG" || return 1
+  # The +x must live on the source file (symlinks have no permissions of
+  # their own). Try without sudo first — $HOME-relative trusted paths are
+  # owned by the current uid — then escalate for root-owned system paths.
+  # Only attempt the sudo path when $SUDO_PREFIX is non-empty; otherwise
+  # the retry is identical to the first attempt and would always fail.
+  if [ ! -x "$source" ]; then
+    chmod +x "$source" 2>>"$FIX_LOG" || \
+      { [ -n "$SUDO_PREFIX" ] && $SUDO_PREFIX chmod +x "$source" 2>>"$FIX_LOG"; } || \
+      return 1
+  fi
 }
 
 install_via_path() {
   local path_dir="$1"
+  # Reject anything that isn't an absolute path with safe characters.
+  # path_dir is appended verbatim into shell rc files, so an unconstrained
+  # value (e.g. "/x\"; rm -rf $HOME #") would inject arbitrary shell into
+  # every future login. Spaces are intentionally excluded — system install
+  # paths never contain spaces, and spaces in PATH assignments create
+  # word-splitting ambiguity in shell rc files.
+  if [ -z "$path_dir" ] || [ "${path_dir:0:1}" != "/" ]; then
+    echo "[tokenless-env-fix] BLOCKED: install_via_path requires an absolute path, got: ${path_dir}"
+    return 1
+  fi
+  if ! echo "$path_dir" | grep -qE '^/[A-Za-z0-9._/+-]+$'; then
+    echo "[tokenless-env-fix] BLOCKED: install_via_path path contains unsafe characters: ${path_dir}"
+    return 1
+  fi
   if [[ ":$PATH:" != *":${path_dir}:"* ]]; then
     export PATH="${path_dir}:${PATH}"
-    local shell_rc="${HOME}/.bashrc"
-    [ -f "${HOME}/.zshrc" ] && shell_rc="${HOME}/.zshrc"
-    grep -q "${path_dir}" "$shell_rc" 2>/dev/null || echo "export PATH=\"${path_dir}:\$PATH\"" >> "$shell_rc"
+    # Resolve home from passwd (not $HOME) to prevent an attacker-controlled
+    # $HOME from redirecting rc-file writes. Falls back to $HOME only when
+    # getent is unavailable — the is_trusted_source_path guard already
+    # covers this path. NOTE: Rust-side home.rs uses getpwuid_r and never
+    # falls back to $HOME; the shell-side fallback here is a tolerated
+    # inconsistency because install_via_path is only called after the
+    # stricter is_trusted_source_path check passes.
+    local real_home="$HOME"
+    if command -v getent &>/dev/null; then
+      real_home=$(getent passwd "$(id -u)" 2>/dev/null | awk -F: 'NR==1{print $6}') || true
+    fi
+    [ -n "$real_home" ] || real_home="$HOME"
+    local shell_rc="${real_home}/.bashrc"
+    [ -f "${real_home}/.zshrc" ] && shell_rc="${real_home}/.zshrc"
+    if ! grep -Fq "export PATH=\"${path_dir}" "$shell_rc" 2>/dev/null; then
+      echo "[tokenless-env-fix] adding ${path_dir} to PATH in ${shell_rc}"
+      echo "export PATH=\"${path_dir}:\$PATH\"" >> "$shell_rc"
+    fi
   fi
 }
 
@@ -245,25 +373,53 @@ install_via_curl_pipe_sh() {
   local url="$1"
   local args="${2:-}"
   local timeout_secs="${3:-120}"
-  # Only allow HTTPS URLs from trusted domains (anchored with path separator)
-  local allowed_domains="^https://(github\.com/|raw\.githubusercontent\.com/|sh\.rustup\.rs(/|$)|get\.docker\.com(/|$)|cli\.run\.nu(/|$)|get\.starship\.rs(/|$)|astral\.sh(/|$))"
+  # Only allow HTTPS URLs from trusted install-script hosts. The github
+  # entries require a concrete owner/repo path segment (no root-level
+  # github.com/ or raw.githubusercontent.com/), so an attacker who only
+  # controls a repo cannot satisfy the regex with a single-segment URL.
+  local allowed_domains='^https://('
+  allowed_domains+='raw\.githubusercontent\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/'
+  allowed_domains+='|github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/raw/'
+  allowed_domains+='|sh\.rustup\.rs(/|$)'
+  allowed_domains+='|get\.docker\.com(/|$)'
+  allowed_domains+='|cli\.run\.nu(/|$)'
+  allowed_domains+='|get\.starship\.rs(/|$)'
+  allowed_domains+='|astral\.sh(/|$)'
+  allowed_domains+=')'
   if ! echo "$url" | grep -qE "$allowed_domains"; then
     echo "[tokenless-env-fix] BLOCKED: curl|sh denied — untrusted or non-HTTPS URL: $url"
     return 1
   fi
   echo "[tokenless-env-fix] NOTE: executing remote script from $url (timeout: ${timeout_secs}s)"
+  # Append curl/wget stderr to $FIX_LOG (instead of /dev/null) so a silent
+  # network failure leaves a diagnostic behind. PIPESTATUS is then inspected
+  # to surface a non-zero downloader exit — a bare `curl … | sh` would
+  # otherwise return 0 whenever `sh` consumes a truncated/empty pipe.
+  local rc
   if command -v curl &>/dev/null; then
     if [ -n "$args" ]; then
-      timeout "$timeout_secs" curl -fsSL --max-redirs 5 "$url" 2>/dev/null | timeout "$timeout_secs" sh -s -- "$args"
+      timeout "$timeout_secs" curl -fsSL --max-redirs 5 "$url" 2>>"$FIX_LOG" | timeout "$timeout_secs" sh -s -- "$args"
     else
-      timeout "$timeout_secs" curl -fsSL --max-redirs 5 "$url" 2>/dev/null | timeout "$timeout_secs" sh
+      timeout "$timeout_secs" curl -fsSL --max-redirs 5 "$url" 2>>"$FIX_LOG" | timeout "$timeout_secs" sh
     fi
+    rc=("${PIPESTATUS[@]}")
+    if [ "${rc[0]:-1}" -ne 0 ]; then
+      echo "[tokenless-env-fix] curl failed for $url (exit ${rc[0]:-?}); see $FIX_LOG" >&2
+      return 1
+    fi
+    return "${rc[1]:-0}"
   elif command -v wget &>/dev/null; then
     if [ -n "$args" ]; then
-      timeout "$timeout_secs" wget --max-redirect=5 -qO- "$url" | timeout "$timeout_secs" sh -s -- "$args"
+      timeout "$timeout_secs" wget --max-redirect=5 -qO- "$url" 2>>"$FIX_LOG" | timeout "$timeout_secs" sh -s -- "$args"
     else
-      timeout "$timeout_secs" wget --max-redirect=5 -qO- "$url" | timeout "$timeout_secs" sh
+      timeout "$timeout_secs" wget --max-redirect=5 -qO- "$url" 2>>"$FIX_LOG" | timeout "$timeout_secs" sh
     fi
+    rc=("${PIPESTATUS[@]}")
+    if [ "${rc[0]:-1}" -ne 0 ]; then
+      echo "[tokenless-env-fix] wget failed for $url (exit ${rc[0]:-?}); see $FIX_LOG" >&2
+      return 1
+    fi
+    return "${rc[1]:-0}"
   else
     return 1
   fi
@@ -435,7 +591,7 @@ fix_tool_from_spec() {
     return 1
   fi
   local tool_spec
-  tool_spec=$(jq -c ".\"$tool_name\"" "$SPEC_FILE" 2>/dev/null || echo 'null')
+  tool_spec=$(jq -c --arg key "$tool_name" '.[$key]' "$SPEC_FILE" 2>/dev/null || echo 'null')
   if [ "$tool_spec" = "null" ] || [ -z "$tool_spec" ]; then
     echo "[tokenless-env-fix] no spec for tool: $tool_name"
     return 0

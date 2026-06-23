@@ -23,6 +23,10 @@ if ! command -v jq &>/dev/null; then log_v "jq not found, skipping"; exit 0; fi
 
 # --- File trust validation ---
 # User-writable paths must be owned by current user and not world-writable.
+#
+# KEEP IN SYNC with the Rust equivalent in
+# `crates/tokenless-cli/src/env_check/mod.rs` (`is_trusted_path`).
+# Changes to trust criteria must be applied to both implementations.
 is_trusted_file() {
   local f="$1"
   [ -f "$f" ] || return 1
@@ -30,6 +34,7 @@ is_trusted_file() {
   case "$f" in /usr/share/*|/usr/libexec/*|/usr/lib/anolisa/*|/usr/local/share/*) return 0 ;; esac
   # Resolve symlink target before owner/perm checks
   local check_path="$f"
+  local symlink_parent=""
   if [ -L "$f" ]; then
     local target
     target=$(readlink -f "$f" 2>/dev/null || realpath "$f" 2>/dev/null || echo "")
@@ -37,6 +42,39 @@ is_trusted_file() {
     case "$target" in /usr/share/*|/usr/libexec/*|/usr/lib/anolisa/*|/usr/local/share/*) return 0 ;; esac
     [ -z "$target" ] && return 1
     check_path="$target"
+    # Also check the symlink's own parent directory — if the symlink sits
+    # in a world-writable directory, an attacker can replace the symlink
+    # to point at a malicious file, bypassing the target-level checks below.
+    symlink_parent=$(dirname "$f")
+  fi
+  # Check the parent directory of the resolved target (or the file itself
+  # when it's not a symlink) — a world-writable directory allows an
+  # attacker to unlink and replace the file (TOCTOU), even if the file
+  # itself has correct ownership and permissions. Mirrors the Rust
+  # implementation in env_check.rs (`is_trusted_path`).
+  _check_parent() {
+    local pd="$1"
+    local po
+    po=$(stat -c '%u' "$pd" 2>/dev/null || stat -f '%u' "$pd" 2>/dev/null || echo "-1")
+    if [ "$po" != "$(id -u)" ] && [ "$po" != "0" ]; then
+      log_v "BLOCKED: parent dir of $f owned by uid $po (expected $(id -u) or 0)"
+      return 1
+    fi
+    local pp
+    pp=$(stat -c '%a' "$pd" 2>/dev/null || stat -f '%Lp' "$pd" 2>/dev/null || echo "777")
+    local ppo="${pp: -1}"
+    if (( ppo & 2 )); then
+      log_v "BLOCKED: parent dir of $f is world-writable (perms=$pp)"
+      return 1
+    fi
+    return 0
+  }
+  local parent_dir
+  parent_dir=$(dirname "$check_path")
+  _check_parent "$parent_dir" || return 1
+  # When the path is a symlink, also check the symlink's own parent.
+  if [ -n "$symlink_parent" ] && [ "$symlink_parent" != "$parent_dir" ]; then
+    _check_parent "$symlink_parent" || return 1
   fi
   local file_owner
   file_owner=$(stat -c '%u' "$check_path" 2>/dev/null || stat -f '%u' "$check_path" 2>/dev/null || echo "-1")
@@ -47,7 +85,7 @@ is_trusted_file() {
   local file_perms
   file_perms=$(stat -c '%a' "$check_path" 2>/dev/null || stat -f '%Lp' "$check_path" 2>/dev/null || echo "777")
   local other_perms="${file_perms: -1}"
-  if [ "$other_perms" -ge 6 ] 2>/dev/null; then
+  if (( other_perms & 2 )); then
     log_v "BLOCKED: $f is world-writable (perms=$file_perms)"
     return 1
   fi
@@ -157,31 +195,34 @@ RECOMMENDED=$(normalize_deps "$(jq -c --arg key "$SPEC_KEY" '.[$key].recommended
 PERMISSIONS=$(jq -r --arg key "$SPEC_KEY" '.[$key].permissions[] // empty' "$SPEC_FILE" 2>/dev/null || echo '')
 
 # --- Version comparison helper ---
-# Handles prefixed versions (v22.1.0) and build suffixes (1.2.3-rc1)
+# Handles prefixed versions (v22.1.0), build suffixes (1.2.3-rc1), and
+# arbitrary segment counts (1.2, 1.2.3, 1.2.3.4, etc.).
+# Missing segments are treated as 0.
 version_ge() {
   local installed="$1" required="$2"
   # Strip common prefixes (v, V)
   installed="${installed#v}"; installed="${installed#V}"
   required="${required#v}"; required="${required#V}"
-  local i_major i_minor i_patch r_major r_minor r_patch
-  IFS='.' read -r i_major i_minor i_patch <<< "$installed"
-  # Strip build suffixes per segment
-  i_major="${i_major%%-*}"; i_minor="${i_minor%%-*}"; i_patch="${i_patch%%-*}"
-  IFS='.' read -r r_major r_minor r_patch <<< "$required"
-  r_major="${r_major%%-*}"; r_minor="${r_minor%%-*}"; r_patch="${r_patch%%-*}"
-  # Extract only digits
-  i_major=$(echo "${i_major:-0}" | grep -oE '[0-9]+' | head -1 || echo 0)
-  i_minor=$(echo "${i_minor:-0}" | grep -oE '[0-9]+' | head -1 || echo 0)
-  i_patch=$(echo "${i_patch:-0}" | grep -oE '[0-9]+' | head -1 || echo 0)
-  r_major=$(echo "${r_major:-0}" | grep -oE '[0-9]+' | head -1 || echo 0)
-  r_minor=$(echo "${r_minor:-0}" | grep -oE '[0-9]+' | head -1 || echo 0)
-  r_patch=$(echo "${r_patch:-0}" | grep -oE '[0-9]+' | head -1 || echo 0)
-  [ "$i_major" -gt "$r_major" ] && return 0
-  [ "$i_major" -lt "$r_major" ] && return 1
-  [ "$i_minor" -gt "$r_minor" ] && return 0
-  [ "$i_minor" -lt "$r_minor" ] && return 1
-  [ "$i_patch" -gt "$r_patch" ] && return 0
-  [ "$i_patch" -lt "$r_patch" ] && return 1
+
+  # Split both versions into segments, stripping build suffixes per segment
+  local i_segments r_segments
+  IFS='.' read -r -a i_segments <<< "$installed"
+  IFS='.' read -r -a r_segments <<< "$required"
+
+  # Find the longer segment count for comparison
+  local max_len=${#i_segments[@]}
+  [ "${#r_segments[@]}" -gt "$max_len" ] && max_len=${#r_segments[@]}
+
+  local i=0 iv rv
+  while [ "$i" -lt "$max_len" ]; do
+    # Extract digits from current segment (strip -rc1, +build, etc.)
+    iv=$(echo "${i_segments[$i]:-0}" | grep -oE '^[0-9]+' | head -1 || echo 0)
+    rv=$(echo "${r_segments[$i]:-0}" | grep -oE '^[0-9]+' | head -1 || echo 0)
+    iv=${iv:-0}; rv=${rv:-0}
+    [ "$iv" -gt "$rv" ] && return 0
+    [ "$iv" -lt "$rv" ] && return 1
+    i=$((i + 1))
+  done
   return 0
 }
 
@@ -264,6 +305,8 @@ for i in $(seq 0 $((req_count - 1))); do
   esac
 done
 
+REQUIRED_MISSING_COUNT=$(echo "$MISSING_DEP_JSONS" | jq 'length' 2>/dev/null || echo 0)
+
 # Check recommended deps
 rec_count=$(echo "$RECOMMENDED" | jq 'length')
 missing_count_rec=0
@@ -322,7 +365,9 @@ if [ "$missing_count" -gt 0 ] && [ -n "$FIX_SCRIPT" ] && [ -x "$FIX_SCRIPT" ]; t
         binary=$(echo "$MISSING_DEP_JSONS" | jq -r ".[$i].binary")
         if ! resolve_binary "$binary" >/dev/null 2>&1; then
             STILL_MISSING="${STILL_MISSING} ${binary}"
-            HAS_REQUIRED_MISSING=true
+            if [ "$i" -lt "$REQUIRED_MISSING_COUNT" ]; then
+                HAS_REQUIRED_MISSING=true
+            fi
         fi
     done
 

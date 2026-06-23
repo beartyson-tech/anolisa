@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::audit::AuditLogger;
 use crate::config::AppConfig;
+use crate::consolidation::{OwnedAuditEntry, run_consolidation_owned};
 use crate::error::Result;
 use crate::index::{IndexHandle, SearchHit};
 use crate::mount::pick_strategy;
@@ -18,6 +19,7 @@ pub struct MemoryService {
     pub audit: Arc<AuditLogger>,
     pub session: Option<Arc<SessionLogService>>,
     pub index: Option<Arc<IndexHandle>>,
+    pub embedding: Option<Arc<dyn crate::embedding::EmbeddingProvider>>,
     pub git: Option<Arc<crate::git_repo::GitHandle>>,
     pub config: AppConfig,
     /// Whether the active mount strategy entered a user namespace.
@@ -57,9 +59,19 @@ impl MemoryService {
             }
         };
 
+        // Build embedding provider from config. Best-effort.
+        let embedding = match crate::embedding::build_provider(&config.memory.embedding) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("embedding provider unavailable: {e}");
+                None
+            }
+        };
+
         // Start the BM25 index worker if enabled.
+        let embedding_clone = embedding.clone();
         let index = if config.memory.index.enabled {
-            match IndexHandle::open(&mount) {
+            match IndexHandle::open(&mount, embedding_clone) {
                 Ok(h) => Some(Arc::new(h)),
                 Err(e) => {
                     tracing::warn!(
@@ -87,6 +99,7 @@ impl MemoryService {
             audit,
             session,
             index,
+            embedding,
             git,
             config,
             entered_userns,
@@ -142,8 +155,13 @@ impl MemoryService {
 
     // ---- Tier B facade methods ----
 
-    pub fn memory_search(&self, query: &str, top_k: usize) -> Result<Vec<SearchHit>> {
-        crate::tools::memory_search(self, query, top_k)
+    pub fn memory_search(
+        &self,
+        query: &str,
+        top_k: usize,
+        mode: Option<&str>,
+    ) -> Result<Vec<SearchHit>> {
+        crate::tools::memory_search(self, query, top_k, mode)
     }
 
     pub fn memory_observe(&self, content: &str, hint: Option<&str>) -> Result<String> {
@@ -208,6 +226,92 @@ impl MemoryService {
 
     pub fn mem_revert(&self, path: &str) -> Result<String> {
         crate::tools::mem_revert(self, path)
+    }
+
+    /// Consolidate the current session's audit log into L1 atomic facts.
+    /// Called during shutdown, after the session log is complete but before
+    /// the session directory is discarded. Best-effort — failures are logged
+    /// but do not block shutdown.
+    ///
+    /// Returns the number of facts written (0 when consolidation was skipped
+    /// or produced nothing).
+    pub fn consolidate(&self) -> usize {
+        let config = &self.config.memory.consolidation;
+        if !config.enabled {
+            tracing::debug!("consolidation disabled, skipping");
+            return 0;
+        }
+
+        let session = match &self.session {
+            Some(s) => s,
+            None => {
+                tracing::debug!("no session available, skipping consolidation");
+                return 0;
+            }
+        };
+
+        // Read the session log.
+        let log_content = match session.read_log() {
+            Ok(s) if !s.is_empty() => s,
+            Ok(_) => {
+                tracing::debug!("session log is empty, skipping consolidation");
+                return 0;
+            }
+            Err(e) => {
+                tracing::warn!("failed to read session log for consolidation: {e}");
+                return 0;
+            }
+        };
+
+        // Parse JSONL entries into owned structs (AuditEntry uses &'static str
+        // for tool which can't be deserialized).
+        let entries: Vec<OwnedAuditEntry> = log_content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<OwnedAuditEntry>(line).ok())
+            .collect();
+
+        if entries.is_empty() {
+            tracing::debug!("no parseable audit entries, skipping consolidation");
+            return 0;
+        }
+
+        let session_id = session.sid().as_str();
+
+        // Convert to OwnedAuditEntry for heuristics.
+        let facts = run_consolidation_owned(&entries, session_id, config);
+        if facts.is_empty() {
+            tracing::debug!("consolidation produced no facts for session {session_id}");
+            return 0;
+        }
+
+        // Write facts to the memory store via safe_fs (namespace sandbox).
+        let root_fd = match (*self.mount.root_fd).try_clone() {
+            Ok(fd) => fd,
+            Err(e) => {
+                tracing::warn!("failed to clone root fd for consolidation: {e}");
+                return 0;
+            }
+        };
+        let writer = crate::consolidation::FactWriter::new(root_fd, &self.mount.root);
+        match writer.write_batch(&facts) {
+            Ok(n) => {
+                tracing::info!(
+                    "consolidation complete: {n}/{} facts written from session {session_id}",
+                    facts.len()
+                );
+                // Log an audit entry for consolidation.
+                self.audit_log(
+                    crate::audit::AuditEntry::new("consolidate")
+                        .path(format!("{n} facts from session {session_id}"))
+                        .bytes(n as u64),
+                );
+                n
+            }
+            Err(e) => {
+                tracing::warn!("consolidation write failed: {e}");
+                0
+            }
+        }
     }
 }
 

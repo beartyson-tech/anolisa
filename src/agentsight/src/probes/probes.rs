@@ -8,22 +8,25 @@ use anyhow::{Context, Result};
 use libbpf_rs::{MapHandle, RingBufferBuilder};
 use std::{
     mem,
-    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::Duration,
 };
 
 use crate::event::Event;
 
-use super::proctrace::{ProcTrace, VariableEvent, ProcEventHeader};
-use super::sslsniff::SslSniff;
-use super::sslsniff::bpf::probe_SSL_data_t as RawSslEvent;
-use super::procmon::{ProcMon, ProcMonEvent};
 use super::filewatch::{FileWatch, RawFileWatchEvent};
 use super::filewrite::{FileWrite as FileWriteProbe, RawFileWriteEvent};
-use super::udpdns::{UdpDns, RawUdpDnsEvent};
-use crate::config::TcpTarget;
+use super::procmon::{ProcMon, ProcMonEvent};
+use super::proctrace::{ProcEventHeader, ProcTrace, VariableEvent};
+use super::shared_maps::SharedMaps;
+use super::sslsniff::SslSniff;
 use super::tcpsniff::TcpSniff;
+use super::udpdns::{RawUdpDnsEvent, UdpDns};
+use crate::config::TcpTarget;
 
 const POLL_TIMEOUT_MS: u64 = 100;
 
@@ -36,7 +39,7 @@ const EVENT_SOURCE_FILEWRITE: u32 = 5;
 const EVENT_SOURCE_UDPDNS: u32 = 6;
 
 /// Unified probe manager that coordinates sslsniff and proctrace
-/// 
+///
 /// This manager ensures both probes share the same traced_processes map
 /// and the same ring buffer, allowing coordinated process tracing where:
 /// - proctrace captures process creation events
@@ -66,48 +69,104 @@ pub struct Probes {
 
 impl Probes {
     /// Create a new unified probe manager
-    /// 
+    ///
     /// # Arguments
     /// * `target_pids` - Initial PIDs to trace (empty means trace all matching UID)
     /// * `target_uid` - Optional UID filter
-    pub fn new(target_pids: &[u32], target_uid: Option<u32>, enable_filewatch: bool, enable_udpdns: bool, tcp_targets: &[TcpTarget]) -> Result<Self> {
-        // Create proctrace first - it will own the traced_processes map and ring buffer
-        let proctrace = ProcTrace::new_with_target(target_pids, target_uid)
-            .context("failed to create proctrace")?;
-        
-        // Get handles to the shared maps for reuse
-        let map_handle = proctrace.traced_processes_handle()
-            .context("failed to get traced_processes handle")?;
-        let rb_handle = proctrace.rb_handle()
-            .context("failed to get rb handle")?;
-        
-        // Create sslsniff - it will reuse both the traced_processes map and ring buffer
-        let sslsniff = SslSniff::new_with_traced_processes(Some(&map_handle), Some(&rb_handle))
-            .context("failed to create sslsniff")?;
+    /// * `enable_filewatch` - Enable filewatch probe
+    /// * `enable_udpdns` - Enable udpdns probe
+    /// * `tcp_targets` - TCP targets for plain HTTP capture
+    pub fn new(
+        target_pids: &[u32],
+        target_uid: Option<u32>,
+        enable_filewatch: bool,
+        enable_udpdns: bool,
+        tcp_targets: &[TcpTarget],
+    ) -> Result<Self> {
+        Self::new_with_cgroup_filter(
+            target_pids,
+            target_uid,
+            enable_filewatch,
+            enable_udpdns,
+            tcp_targets,
+            false,
+        )
+    }
 
-        // Create procmon - it reuses the ring buffer
-        let procmon = ProcMon::new_with_rb(&rb_handle)
-            .context("failed to create procmon")?;
+    /// Create a new unified probe manager with explicit cgroup-level filtering toggle.
+    ///
+    /// When `cgroup_filter_enabled` is true, every probe (except procmon, which
+    /// keeps full audit coverage) gates its events behind the shared
+    /// `cgroup_filter` map. Cgroup ids can then be registered at runtime via
+    /// `add_traced_cgroup`. When false (default), every probe behaves exactly
+    /// like before this feature existed.
+    pub fn new_with_cgroup_filter(
+        target_pids: &[u32],
+        target_uid: Option<u32>,
+        enable_filewatch: bool,
+        enable_udpdns: bool,
+        tcp_targets: &[TcpTarget],
+        cgroup_filter_enabled: bool,
+    ) -> Result<Self> {
+        // Create proctrace first - it owns the traced_processes map, the ring
+        // buffer, and (when enabled) the cgroup_filter map.
+        let proctrace = ProcTrace::new_with_target_and_maps(
+            target_pids,
+            target_uid,
+            None,
+            None,
+            cgroup_filter_enabled,
+        )
+        .context("failed to create proctrace")?;
 
-        // Optionally create filewatch - it reuses both the traced_processes map and ring buffer
+        // Ring buffer handle kept for the polling thread (see `run`).
+        let rb_handle = proctrace.rb_handle().context("failed to get rb handle")?;
+
+        // Bundle the maps proctrace owns so every follower probe can reuse them
+        // through a single `&SharedMaps` argument instead of a growing list of
+        // individual `&MapHandle` parameters.
+        //
+        // The cgroup_filter handle is only fetched when the feature is on; when
+        // off, each probe loads its own private (unused) cgroup_filter map so we
+        // never burn an extra fd in the steady state.
+        let mut shared = SharedMaps::new(proctrace.rb_handle().context("failed to get rb handle")?)
+            .with_traced_processes(
+                proctrace
+                    .traced_processes_handle()
+                    .context("failed to get traced_processes handle")?,
+            )
+            .with_cgroup_filter_enabled(cgroup_filter_enabled);
+        if cgroup_filter_enabled {
+            shared = shared.with_cgroup_filter(
+                proctrace
+                    .cgroup_filter_handle()
+                    .context("failed to get cgroup_filter handle")?,
+            );
+        }
+
+        // Create sslsniff - reuses the shared ring buffer and process filter.
+        let sslsniff = SslSniff::new_with_shared(&shared).context("failed to create sslsniff")?;
+
+        // Create procmon - reuses the ring buffer only (no cgroup filter: full audit)
+        let procmon = ProcMon::new_with_shared(&shared).context("failed to create procmon")?;
+
+        // Optionally create filewatch - reuses ring buffer + process/cgroup filters
         let filewatch = if enable_filewatch {
-            let fw = FileWatch::new_with_maps(&map_handle, &rb_handle)
-                .context("failed to create filewatch")?;
+            let fw = FileWatch::new_with_shared(&shared).context("failed to create filewatch")?;
             Some(fw)
         } else {
             log::info!("FileWatch probe disabled");
             None
         };
 
-        // Create filewrite - it reuses both the traced_processes map and ring buffer (always enabled)
-        let filewrite = FileWriteProbe::new_with_maps(&map_handle, &rb_handle)
-            .context("failed to create filewrite")?;
+        // Create filewrite - reuses ring buffer + process/cgroup filters (always enabled)
+        let filewrite =
+            FileWriteProbe::new_with_shared(&shared).context("failed to create filewrite")?;
 
-        // Optionally create udpdns - it reuses traced_processes map and ring buffer
+        // Optionally create udpdns - reuses ring buffer + process filter
         // Skips already-traced processes to avoid redundant discovery events
         let udpdns = if enable_udpdns {
-            let dns = UdpDns::new_with_maps(&map_handle, &rb_handle)
-                .context("failed to create udpdns")?;
+            let dns = UdpDns::new_with_shared(&shared).context("failed to create udpdns")?;
             Some(dns)
         } else {
             log::info!("UDP DNS probe disabled (no https/http domain rules configured)");
@@ -116,8 +175,8 @@ impl Probes {
 
         // Optionally create tcpsniff - captures plain HTTP traffic to configured IP/port targets
         let tcpsniff = if !tcp_targets.is_empty() {
-            let mut tcp = TcpSniff::new_with_maps(&rb_handle)
-                .context("failed to create tcpsniff")?;
+            let mut tcp =
+                TcpSniff::new_with_shared(&shared).context("failed to create tcpsniff")?;
             tcp.set_targets(tcp_targets)
                 .context("failed to set tcp targets")?;
             Some(tcp)
@@ -127,7 +186,7 @@ impl Probes {
         };
 
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
-        
+
         Ok(Self {
             proctrace,
             sslsniff,
@@ -145,26 +204,25 @@ impl Probes {
     /// Attach all probes
     pub fn attach(&mut self) -> Result<()> {
         // Attach procmon for process monitoring
-        self.procmon.attach()
-            .context("failed to attach procmon")?;
-        self.proctrace.attach().context("failed to attach proctrace")?;
+        self.procmon.attach().context("failed to attach procmon")?;
+        self.proctrace
+            .attach()
+            .context("failed to attach proctrace")?;
         // Attach filewatch for .jsonl file monitoring (if enabled)
         if let Some(ref mut fw) = self.filewatch {
-            fw.attach()
-                .context("failed to attach filewatch")?;
+            fw.attach().context("failed to attach filewatch")?;
         }
         // Attach filewrite for JSON write monitoring (always enabled)
-        self.filewrite.attach()
+        self.filewrite
+            .attach()
             .context("failed to attach filewrite")?;
         // Attach udpdns for DNS query capture (if enabled)
         if let Some(ref mut dns) = self.udpdns {
-            dns.attach()
-                .context("failed to attach udpdns")?;
+            dns.attach().context("failed to attach udpdns")?;
         }
         // Attach tcpsniff for plain HTTP traffic capture (if enabled)
         if let Some(ref mut tcp) = self.tcpsniff {
-            tcp.attach()
-                .context("failed to attach tcpsniff")?;
+            tcp.attach().context("failed to attach tcpsniff")?;
         }
         // sslsniff uses uprobes attached per-process via attach_process()
         Ok(())
@@ -177,7 +235,8 @@ impl Probes {
 
     /// Attach SSL probes to a specific process
     pub fn attach_ssl_to_process(&mut self, pid: i32) -> Result<()> {
-        self.sslsniff.attach_process(pid)
+        self.sslsniff
+            .attach_process(pid)
             .context("failed to attach sslsniff to process")?;
         Ok(())
     }
@@ -188,7 +247,6 @@ impl Probes {
     /// events as unified Event type to the channel.
     pub fn run(&self) -> Result<ProbesPoller> {
         let proc_min_sz = mem::size_of::<ProcEventHeader>();
-        let ssl_event_size = mem::size_of::<RawSslEvent>();
         let procmon_event_size = mem::size_of::<ProcMonEvent>();
         let filewatch_event_size = mem::size_of::<RawFileWatchEvent>();
         let filewrite_event_size = mem::size_of::<RawFileWriteEvent>();
@@ -217,15 +275,9 @@ impl Probes {
                         }
                     }
                     EVENT_SOURCE_SSL => {
-                        // SSL event - convert raw BPF data to user-space SslEvent
-                        if data.len() >= ssl_event_size {
-                            // SAFETY: BPF guarantees layout and alignment
-                            let raw = unsafe { &*(data.as_ptr() as *const RawSslEvent) };
-                            let ssl_event = crate::probes::sslsniff::SslEvent::from_bpf(raw);
-                            Some(Event::Ssl(ssl_event))
-                        } else {
-                            None
-                        }
+                        // SSL records are variable-length (tiered reservation):
+                        // decode by header prefix + buf_size, not a full-struct cast.
+                        crate::probes::sslsniff::SslEvent::from_bytes(data).map(Event::Ssl)
                     }
                     EVENT_SOURCE_PROCMON => {
                         // Process monitor event
@@ -265,7 +317,7 @@ impl Probes {
                         None
                     }
                 };
-                
+
                 if let Some(e) = event {
                     let _ = event_tx.send(e);
                 }
@@ -312,13 +364,15 @@ impl Probes {
 
     /// Add a PID to the traced_processes map at runtime
     pub fn add_traced_pid(&mut self, pid: u32) -> Result<()> {
-        self.proctrace.add_traced_pid(pid)
+        self.proctrace
+            .add_traced_pid(pid)
             .context("failed to add traced pid")
     }
 
     /// Remove a PID from the traced_processes map at runtime
     pub fn remove_traced_pid(&mut self, pid: u32) -> Result<()> {
-        self.proctrace.remove_traced_pid(pid)
+        self.proctrace
+            .remove_traced_pid(pid)
             .context("failed to remove traced pid")
     }
 
@@ -331,7 +385,7 @@ impl Probes {
         if let Some(ref mut tcp) = self.tcpsniff {
             tcp.add_target(target)
         } else {
-            log::warn!("TcpSniff not enabled, cannot add runtime target {:?}", target);
+            log::warn!("TcpSniff not enabled, cannot add runtime target {target:?}");
             Ok(())
         }
     }
@@ -339,6 +393,26 @@ impl Probes {
     /// Get a handle to the traced_processes map
     pub fn traced_processes_handle(&self) -> Result<MapHandle> {
         self.proctrace.traced_processes_handle()
+    }
+
+    /// Add a cgroup inode id to the shared cgroup_filter map at runtime.
+    ///
+    /// Has no observable effect unless probes were created with
+    /// `cgroup_filter_enabled = true`; in that case, only events from
+    /// processes whose cgroup id is registered here will be emitted by
+    /// proctrace / filewatch / filewrite. sslsniff, udpdns, and procmon are
+    /// unaffected.
+    pub fn add_traced_cgroup(&mut self, cgroup_id: u64) -> Result<()> {
+        self.proctrace
+            .add_traced_cgroup(cgroup_id)
+            .context("failed to add traced cgroup")
+    }
+
+    /// Remove a cgroup inode id from the shared cgroup_filter map at runtime.
+    pub fn remove_traced_cgroup(&mut self, cgroup_id: u64) -> Result<()> {
+        self.proctrace
+            .remove_traced_cgroup(cgroup_id)
+            .context("failed to remove traced cgroup")
     }
 }
 

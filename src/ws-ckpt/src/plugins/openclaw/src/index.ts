@@ -10,16 +10,16 @@
  * - 3 hooks: message_received, agent_end, session_start
  */
 
-import { PluginConfigManager, parseDaemonAutoCleanupConfig, daemonAutoCleanup } from "./config.js";
+import { PluginConfigManager } from "./config.js";
 import { EnvironmentChecker } from "./environment-check.js";
 import { BtrfsManager } from "./btrfs-manager.js";
-import { CommandExecutor } from "./commands.js";
 import type { PluginConfig } from "./types.js";
+import { loadPersistedConfig } from "./persist.js";
 import {
   definePluginEntry,
   type OpenClawPluginApi,
 } from "../types-shim.js";
-import { pluginState, cwdInsideWorkspace, CWD_INSIDE_WORKSPACE_REASON } from "./state.js";
+import { pluginState, cwdInsideWorkspace, cwdInsideWorkspaceReason } from "./state.js";
 import { registerTools } from "./tool-registry.js";
 import { registerHooks } from "./hooks.js";
 import { ensureToolsAlsoAllow } from "./whitelist.js";
@@ -39,14 +39,11 @@ import { ensureToolsAlsoAllow } from "./whitelist.js";
  */
 function register(api: OpenClawPluginApi): void {
   pluginState.pluginApi = api;
-  const rawConfig = api.pluginConfig ?? {};
 
   // ------------------------------------------------------------------
   // 1. Load and validate configuration
   // ------------------------------------------------------------------
-  const configManager = new PluginConfigManager(
-    rawConfig as Partial<PluginConfig>,
-  );
+  const configManager = new PluginConfigManager(loadPersistedConfig());
   const validation = configManager.validate();
   // Keep object identity stable across reloads so stale hook closures stay live.
   const fresh = configManager.getConfig();
@@ -83,9 +80,10 @@ function register(api: OpenClawPluginApi): void {
       return;
     }
 
-    if (cwdInsideWorkspace(config.workspace)) {
+    const cwdCheck = cwdInsideWorkspace(config.workspace);
+    if (cwdCheck.inside) {
       pluginState.environmentReady = false;
-      console.warn(`[ws-ckpt] Refusing: ${CWD_INSIDE_WORKSPACE_REASON}`);
+      console.warn(`[ws-ckpt] Refusing: ${cwdInsideWorkspaceReason(cwdCheck.cwd, config.workspace)}`);
     } else {
       try {
         const ok = await pluginState.manager!.ensureWorkspace(config.workspace);
@@ -104,14 +102,10 @@ function register(api: OpenClawPluginApi): void {
       }
     }
 
-    // Query daemon auto-cleanup config to align in-memory state.
-    const cmd = new CommandExecutor();
-    const cfgResult = await cmd.config();
-    if (cfgResult.exitCode === 0) {
-      const { cleanupNum, cleanupDuration } = parseDaemonAutoCleanupConfig(cfgResult.stdout);
-      daemonAutoCleanup.cleanupNum = cleanupNum;
-      daemonAutoCleanup.cleanupDuration = cleanupDuration;
-    }
+    // No register-time policy prefetch: the view tool queries daemon
+    // every call anyway, and a stale prefetch from register time would
+    // mislead the user/LLM if the policy changed since then. Aligns with
+    // the hermes plugin (no cache).
   })();
 
   // ------------------------------------------------------------------
@@ -150,8 +144,10 @@ export { register };
 // Re-export components for external consumers
 export { BtrfsManager } from "./btrfs-manager.js";
 export { CommandExecutor } from "./commands.js";
+export { CrontabManager } from "./cron.js";
 export { SnapshotStore } from "./snapshot-store.js";
 export { PluginConfigManager, DEFAULT_CONFIG } from "./config.js";
+export { loadPersistedConfig, persistConfig } from "./persist.js";
 export { EnvironmentChecker } from "./environment-check.js";
 export type {
   PluginConfig,

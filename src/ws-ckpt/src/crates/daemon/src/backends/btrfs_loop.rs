@@ -13,7 +13,7 @@ use ws_ckpt_common::{DaemonConfig, DiffEntry, WorkspaceInfo, SNAPSHOTS_DIR};
 
 use super::btrfs_common;
 use crate::util::{is_mounted, run_command, run_command_checked};
-use btrfs_common::resolve_symlink_path;
+use btrfs_common::{backup_path_for, resolve_symlink_path};
 
 pub struct BtrfsLoopBackend {
     pub mount_path: PathBuf,
@@ -31,13 +31,14 @@ impl BtrfsLoopBackend {
         }
     }
 
-    /// Internal init implementation; caller wraps with cleanup-on-failure.
+    /// Internal init implementation; caller wraps with cleanup-on-failure. Sets `*backup_owned` after step 3.
     async fn do_init_storage(
         &self,
         original_path: &str,
         ws_id: &str,
         subvol_path: &Path,
         snap_dir: &Path,
+        backup_owned: &mut bool,
     ) -> anyhow::Result<()> {
         // 1. Create subvolume
         btrfs_common::create_subvolume(subvol_path).await?;
@@ -47,17 +48,30 @@ impl BtrfsLoopBackend {
             .await
             .context("failed to create snapshots directory")?;
 
-        // 3. rsync migration
-        // --copy-unsafe-links: dereference symlinks that point outside the source tree
-        // (e.g. symlinks to other ws-* subvolumes inside mount point)
-        let src = format!("{}/", original_path); // trailing / is important
+        // 3. Record permissions and move original aside as backup (#673).
+        //    Must happen BEFORE data migration so cleanup always restores full data.
+        let orig_meta = tokio::fs::metadata(original_path)
+            .await
+            .context("failed to read original directory metadata")?;
+        let orig_uid = orig_meta.uid();
+        let orig_gid = orig_meta.gid();
+
+        let backup_path = backup_path_for(original_path);
+        if tokio::fs::symlink_metadata(&backup_path).await.is_ok() {
+            anyhow::bail!(
+                "refusing to overwrite pre-existing backup {:?}; remove it manually first",
+                backup_path
+            );
+        }
+        tokio::fs::rename(original_path, &backup_path)
+            .await
+            .context("failed to rename original directory to backup")?;
+        *backup_owned = true;
+
+        // 4. rsync migration from backup into subvolume
+        let src = format!("{}/", backup_path);
         let status = Command::new("rsync")
-            .args([
-                "-a",
-                "--copy-unsafe-links",
-                &src,
-                &subvol_path.to_string_lossy(),
-            ])
+            .args(["-a", &src, &subvol_path.to_string_lossy()])
             .status()
             .await
             .context("failed to run rsync")?;
@@ -65,7 +79,7 @@ impl BtrfsLoopBackend {
             anyhow::bail!("rsync failed with exit code: {:?}", status.code());
         }
 
-        // 3a. Flush dirty data to disk so subsequent snapshots are instant
+        // 4a. Flush dirty data to disk so subsequent snapshots are instant
         let sync_status = Command::new("btrfs")
             .args(["filesystem", "sync", &subvol_path.to_string_lossy()])
             .status()
@@ -76,19 +90,7 @@ impl BtrfsLoopBackend {
             Command::new("sync").status().await.ok();
         }
 
-        // 4. Record original directory permissions before removal
-        let orig_meta = tokio::fs::metadata(original_path)
-            .await
-            .context("failed to read original directory metadata")?;
-        let orig_uid = orig_meta.uid();
-        let orig_gid = orig_meta.gid();
-
-        // 5. Remove original directory (data is safely in btrfs subvolume now)
-        tokio::fs::remove_dir_all(original_path)
-            .await
-            .context("failed to remove original directory")?;
-
-        // 6. Create symlink: user path -> btrfs subvolume
+        // 5. Create symlink: user path -> btrfs subvolume
         if let Some(parent) = Path::new(original_path).parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -98,7 +100,7 @@ impl BtrfsLoopBackend {
             .await
             .context("failed to create symlink")?;
 
-        // 6a. Restore ownership on the subvolume root to match original directory
+        // 5a. Restore ownership on the subvolume root to match original directory
         chown(
             subvol_path,
             Some(Uid::from_raw(orig_uid)),
@@ -106,7 +108,7 @@ impl BtrfsLoopBackend {
         )
         .context("failed to restore subvolume ownership")?;
 
-        // 7. Verify symlink
+        // 6. Verify symlink
         let link_target = tokio::fs::read_link(original_path)
             .await
             .context("symlink verification failed: cannot read link")?;
@@ -118,26 +120,20 @@ impl BtrfsLoopBackend {
             );
         }
 
+        // 7. Drop backup. A leftover .pre-init-bak blocks the next init.
+        if let Err(e) = tokio::fs::remove_dir_all(&backup_path).await {
+            error!(
+                "init ok but backup remove failed {:?}: {}; next init will fail until removed",
+                backup_path, e
+            );
+        }
+
         info!(
             "BtrfsLoopBackend: storage init complete for ws_id={}, subvol={}",
             ws_id,
             subvol_path.display()
         );
         Ok(())
-    }
-
-    /// Cleanup partially-created storage on init failure.
-    async fn cleanup_init_storage(original_path: &str, subvol_path: &Path, snap_dir: &Path) {
-        // Remove symlink if it exists
-        let _ = tokio::fs::remove_file(original_path).await;
-
-        // Remove snapshots dir
-        let _ = tokio::fs::remove_dir_all(snap_dir).await;
-
-        // Delete subvolume (best effort)
-        if let Err(e) = btrfs_common::delete_subvolume(subvol_path).await {
-            error!("cleanup: failed to delete subvolume: {}", e);
-        }
     }
 }
 
@@ -167,12 +163,25 @@ impl StorageBackend for BtrfsLoopBackend {
         let subvol_path = self.mount_path.join(ws_id);
         let snap_dir = self.snapshots_dir.join(ws_id);
 
+        let mut backup_owned = false;
         if let Err(e) = self
-            .do_init_storage(&resolved_str, ws_id, &subvol_path, &snap_dir)
+            .do_init_storage(
+                &resolved_str,
+                ws_id,
+                &subvol_path,
+                &snap_dir,
+                &mut backup_owned,
+            )
             .await
         {
             error!("init_workspace storage failed, cleaning up: {:#}", e);
-            Self::cleanup_init_storage(&resolved_str, &subvol_path, &snap_dir).await;
+            btrfs_common::cleanup_init_storage(
+                &resolved_str,
+                &subvol_path,
+                &snap_dir,
+                backup_owned,
+            )
+            .await;
             return Err(e);
         }
 
@@ -236,15 +245,21 @@ impl StorageBackend for BtrfsLoopBackend {
         let subvol_path = self.mount_path.join(ws_id);
         let snap_base = self.snapshots_dir.join(ws_id);
 
-        // 1. Remove symlink (skip if not a symlink)
-        let is_symlink = match tokio::fs::symlink_metadata(original_path).await {
-            Ok(meta) => meta.file_type().is_symlink(),
-            Err(_) => false,
-        };
-        if is_symlink {
-            tokio::fs::remove_file(original_path)
-                .await
-                .context("failed to remove symlink")?;
+        // 1. Remove symlink; refuse if a non-symlink directory occupies the path
+        match tokio::fs::symlink_metadata(original_path).await {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                tokio::fs::remove_file(original_path)
+                    .await
+                    .context("failed to remove symlink")?;
+            }
+            Ok(_) => {
+                bail!(
+                    "cannot recover: {} is a regular directory, not a workspace symlink; \
+                     move or rename it first to avoid data loss",
+                    original_path
+                );
+            }
+            Err(_) => {} // path gone, rsync will recreate
         }
 
         // 2. Rsync subvolume contents back to original path (restore as normal directory)
@@ -264,8 +279,9 @@ impl StorageBackend for BtrfsLoopBackend {
             .await
             .context("failed to run rsync")?;
         if !rsync_status.success() {
-            error!(
-                "rsync failed restoring {} -> {}, exit: {:?}",
+            bail!(
+                "rsync failed restoring {} -> {}, exit: {:?}; \
+                 workspace and snapshots preserved for retry",
                 src,
                 original_path,
                 rsync_status.code()
@@ -313,11 +329,21 @@ impl StorageBackend for BtrfsLoopBackend {
         Ok(())
     }
 
-    async fn diff(&self, ws_id: &str, from: &str, to: &str) -> anyhow::Result<Vec<DiffEntry>> {
+    async fn diff(
+        &self,
+        ws_id: &str,
+        from: &str,
+        to: Option<&str>,
+    ) -> anyhow::Result<Vec<DiffEntry>> {
         let snap_base = self.snapshots_dir.join(ws_id);
         let snap_from = snap_base.join(from);
-        let snap_to = snap_base.join(to);
-        btrfs_common::diff_between_snapshots(&snap_from, &snap_to).await
+        match to {
+            Some(id) => btrfs_common::diff_between_snapshots(&snap_from, &snap_base.join(id)).await,
+            None => {
+                let live = self.data_root().join(ws_id);
+                btrfs_common::diff_against_live(&snap_from, &live, &snap_base).await
+            }
+        }
     }
 
     async fn cleanup_snapshots(

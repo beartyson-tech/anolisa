@@ -109,7 +109,11 @@ describe("scan-code", () => {
 
       await handler(execEvent("rm -rf /"), {});
 
-      assert.deepEqual(lastCliArgs, ["scan-code", "--code", "rm -rf /", "--language", "bash"]);
+      assert.deepEqual(lastCliArgs?.slice(0, 2), [
+        "--trace-context",
+        JSON.stringify({ agent_name: "openclaw" }),
+      ]);
+      assert.deepEqual(lastCliArgs?.slice(2), ["scan-code", "--code", "rm -rf /", "--language", "bash"]);
       assert.equal(lastCliOpts?.timeout, 10000);
     });
 
@@ -131,6 +135,7 @@ describe("scan-code", () => {
       assert.deepEqual(lastCliArgs?.slice(0, 2), [
         "--trace-context",
         JSON.stringify({
+          agent_name: "openclaw",
           session_id: "session-1",
           run_id: "run-1",
           tool_call_id: "tool-1",
@@ -185,7 +190,11 @@ describe("scan-code", () => {
 
       await handler(execEvent('echo "hello world"'), {});
 
-      assert.deepEqual(lastCliArgs, ["scan-code", "--code", 'echo "hello world"', "--language", "bash"]);
+      assert.deepEqual(lastCliArgs?.slice(0, 2), [
+        "--trace-context",
+        JSON.stringify({ agent_name: "openclaw" }),
+      ]);
+      assert.deepEqual(lastCliArgs?.slice(2), ["scan-code", "--code", 'echo "hello world"', "--language", "bash"]);
     });
   });
 
@@ -357,6 +366,86 @@ describe("scan-code", () => {
       _setCliMock(async () => { throw new Error("process crashed"); });
 
       const result = await handler(execEvent("ls"), {});
+      assert.equal(result, undefined);
+    });
+  });
+
+  // =========================================================================
+  // Dimension 5: Self-Protect Forced Block
+  // =========================================================================
+  describe("self-protect forced block", () => {
+    it("self-protect-openclaw finding forces block regardless of config", async () => {
+      const { handler } = registerAndGetHandler(); // default: codeScanRequireApproval=false
+      mockCli({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          verdict: "warn",
+          findings: [{ rule_id: "shell-self-protect-openclaw", desc_zh: "禁用 agent-sec 插件" }],
+        }),
+        stderr: "",
+      });
+
+      const result = await handler(
+        execEvent("openclaw config set plugins.entries.agent-sec.enabled false"),
+        {},
+      );
+
+      assert.ok(result);
+      assert.equal(result.block, true);
+      assert.ok(result.blockReason.includes("自我保护"));
+      assert.ok(result.blockReason.includes("手动执行"));
+    });
+
+    it("self-protect block includes the original command in message", async () => {
+      const { handler } = registerAndGetHandler();
+      const cmd = "openclaw config set plugins.entries.agent-sec.enabled false && openclaw gateway restart";
+      mockCli({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          verdict: "warn",
+          findings: [{ rule_id: "shell-self-protect-openclaw", desc_zh: "禁用 agent-sec 插件" }],
+        }),
+        stderr: "",
+      });
+
+      const result = await handler(execEvent(cmd), {});
+
+      assert.ok(result);
+      assert.equal(result.block, true);
+      assert.ok(result.blockReason.includes(cmd));
+    });
+
+    it("non-self-protect deny finding does not force block without codeScanRequireApproval", async () => {
+      const { handler } = registerAndGetHandler(); // codeScanRequireApproval=false
+      mockCli({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          verdict: "deny",
+          findings: [{ rule_id: "shell-recursive-delete", desc_zh: "危险删除" }],
+        }),
+        stderr: "",
+      });
+
+      const result = await handler(execEvent("rm -rf /"), {});
+      assert.equal(result, undefined);
+    });
+
+    it("self-protect hermes finding does NOT trigger block in openclaw hook", async () => {
+      const { handler } = registerAndGetHandler();
+      mockCli({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          verdict: "warn",
+          findings: [{ rule_id: "shell-self-protect-hermes", desc_zh: "禁用 hermes 插件" }],
+        }),
+        stderr: "",
+      });
+
+      const result = await handler(
+        execEvent("hermes plugins disable agent-sec-core-hermes-plugin"),
+        {},
+      );
+      // hermes rule should not trigger openclaw self-protect
       assert.equal(result, undefined);
     });
   });

@@ -93,6 +93,18 @@ struct {
     __type(value, __u8);
 } tcp_targets SEC(".maps");
 
+// --- Per-connection HTTP protocol cache ---
+// Once a connection is identified as HTTP (first request/response matches),
+// all subsequent data on that connection is passed through without re-checking.
+// This is critical for SSE/chunked responses where later chunks don't start
+// with HTTP keywords.  LRU eviction handles cleanup without explicit close hooks.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 4096);
+    __type(key, u64);   // sock pointer as connection identifier
+    __type(value, u8);  // 1 = confirmed HTTP
+} tcp_http_conns SEC(".maps");
+
 // --- Stash map for tcp_recvmsg entry → exit ---
 struct tcp_recv_args {
     u64 sk;           // struct sock * as u64
@@ -113,6 +125,7 @@ struct {
 //   1. exact ip+port match
 //   2. ip-only match (port=0 means any port)
 //   3. port-only match (ip=0 means any ip)
+//   4. full wildcard (ip=0, port=0) — capture every TCP connection
 static __always_inline bool is_target_conn(struct sock *sk)
 {
     struct tcp_target_key key = {};
@@ -133,7 +146,43 @@ static __always_inline bool is_target_conn(struct sock *sk)
     // 3. port-only (ip wildcard)
     key.ip = 0;
     key.port = dport;
+    if (bpf_map_lookup_elem(&tcp_targets, &key))
+        return true;
+
+    // 4. full wildcard — match-all (ip=0, port=0)
+    key.port = 0;
     return bpf_map_lookup_elem(&tcp_targets, &key) != NULL;
+}
+
+// Lightweight HTTP protocol detection on already-copied buffer.
+// Returns true if the payload starts with a known HTTP method or "HTTP" response.
+// Used to filter non-HTTP traffic (TLS, Redis, MySQL, etc.) in the BPF layer
+// before submitting to the ring buffer, avoiding costly kernel→userspace copies.
+static __always_inline bool is_http_payload(const char *buf, u32 len)
+{
+    if (len < 4)
+        return false;
+    if (buf[0] == 'H' && buf[1] == 'T' && buf[2] == 'T' && buf[3] == 'P')
+        return true;
+    if (buf[0] == 'G' && buf[1] == 'E' && buf[2] == 'T' && buf[3] == ' ')
+        return true;
+    if (buf[0] == 'P' && buf[1] == 'O' && buf[2] == 'S' && buf[3] == 'T')
+        return true;
+    if (buf[0] == 'P' && buf[1] == 'U' && buf[2] == 'T' && buf[3] == ' ')
+        return true;
+    if (buf[0] == 'H' && buf[1] == 'E' && buf[2] == 'A' && buf[3] == 'D')
+        return true;
+    if (len >= 6 && buf[0] == 'D' && buf[1] == 'E' && buf[2] == 'L' &&
+        buf[3] == 'E' && buf[4] == 'T' && buf[5] == 'E')
+        return true;
+    if (len >= 5 && buf[0] == 'P' && buf[1] == 'A' && buf[2] == 'T' &&
+        buf[3] == 'C' && buf[4] == 'H')
+        return true;
+    if (buf[0] == 'O' && buf[1] == 'P' && buf[2] == 'T' && buf[3] == 'I')
+        return true;
+    if (buf[0] == 'C' && buf[1] == 'O' && buf[2] == 'N' && buf[3] == 'N')
+        return true;
+    return false;
 }
 
 // Emit a probe_SSL_data_t event given a pre-resolved user buffer pointer.
@@ -158,12 +207,18 @@ static __always_inline int emit_tcp_event_buf(
     data->source = EVENT_SOURCE_SSL;  // reuse SSL source for seamless pipeline
     data->timestamp_ns = now;
     data->delta_ns = (start_ns > 0) ? (now - start_ns) : 0;
-    data->pid = (u32)(pid_tgid >> 32);
+    data->pid = current_ns_pid();
     data->tid = (u32)pid_tgid;
     data->uid = bpf_get_current_uid_gid();
     data->len = data_len;
     data->rw = rw;
     data->is_handshake = false;
+    /* Initialize the shared `truncated` header field. tcpsniff masks the payload
+     * to <=1 MiB (below) and never truncates against the 4 MiB cap, so it is 0.
+     * This MUST be set: every EVENT_SOURCE_SSL record shares this header and the
+     * consumer (sslsniff::from_bytes) reads `truncated`; bpf_ringbuf_reserve does
+     * not zero the reservation, so an omitted field reads stale ring bytes. */
+    data->truncated = 0;
     data->ssl_ptr = (u64)sk;  // use sock pointer as connection identifier
 
     // Clamp buffer size for verifier
@@ -175,6 +230,15 @@ static __always_inline int emit_tcp_event_buf(
 
     int ret = bpf_probe_read_user(&data->buf, buf_copy_size, user_buf);
     if (ret == 0) {
+        u64 sk_key = (u64)sk;
+        if (!bpf_map_lookup_elem(&tcp_http_conns, &sk_key)) {
+            if (!is_http_payload((const char *)data->buf, buf_copy_size)) {
+                bpf_ringbuf_discard(data, 0);
+                return 0;
+            }
+            u8 val = 1;
+            bpf_map_update_elem(&tcp_http_conns, &sk_key, &val, BPF_ANY);
+        }
         data->buf_filled = 1;
         data->buf_size = buf_copy_size;
     } else {
@@ -242,12 +306,13 @@ int BPF_PROG(trace_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size
     data->source = EVENT_SOURCE_SSL;
     data->timestamp_ns = now;
     data->delta_ns = 0;
-    data->pid = (u32)(pid_tgid >> 32);
+    data->pid = current_ns_pid();
     data->tid = (u32)pid_tgid;
     data->uid = bpf_get_current_uid_gid();
     data->len = (u32)size;
     data->rw = 1;
     data->is_handshake = false;
+    data->truncated = 0;  /* see emit_tcp_event_buf: shared header field, never truncates against the 4 MiB cap */
     data->ssl_ptr = (u64)sk;
     bpf_get_current_comm(&data->comm, sizeof(data->comm));
 
@@ -258,10 +323,18 @@ int BPF_PROG(trace_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size
 
     int ret = bpf_probe_read_user(&data->buf[0], iov0_copy, iov0_base);
     if (ret != 0) {
-        data->buf_filled = 0;
-        data->buf_size = 0;
-        bpf_ringbuf_submit(data, 0);
+        bpf_ringbuf_discard(data, 0);
         return 0;
+    }
+
+    u64 sk_key = (u64)sk;
+    if (!bpf_map_lookup_elem(&tcp_http_conns, &sk_key)) {
+        if (!is_http_payload((const char *)data->buf, iov0_copy)) {
+            bpf_ringbuf_discard(data, 0);
+            return 0;
+        }
+        u8 val = 1;
+        bpf_map_update_elem(&tcp_http_conns, &sk_key, &val, BPF_ANY);
     }
 
     u32 total_copied = iov0_copy;

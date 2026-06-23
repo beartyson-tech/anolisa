@@ -5,7 +5,7 @@
 .PHONY: python-code-pretty
 python-code-pretty: ## Format Python code using black and isort
 	@echo "🎨 Formatting code with black and isort..."
-	@uv run --project agent-sec-cli isort --profile black --skip-glob "*/backend-skill/templates/*" .
+	@uv run --project agent-sec-cli isort --profile black --line-length 80 --skip-glob "*/backend-skill/templates/*" .
 	@uv run --project agent-sec-cli black --force-exclude "backend-skill/templates/" .
 
 .PHONY: python-lint
@@ -49,14 +49,13 @@ test-python: ## Run Python unit and integration tests
 	cd agent-sec-cli && uv sync
 	uv run --project agent-sec-cli pytest tests/ --ignore=tests/e2e/ -v
 	uv run --project agent-sec-cli pytest tests/e2e/cli -v
+	uv run --project agent-sec-cli pytest tests/e2e/daemon -v
 	@echo "🧪 Running skill-ledger e2e tests..."
 	uv run --project agent-sec-cli python3 tests/e2e/skill-ledger/e2e_test.py
 
 .PHONY: test-prompt-scanner-e2e
-test-prompt-scanner-e2e: ## Run prompt-scanner e2e tests (downloads ML model on first run)
-	@echo "🔥 Warming up prompt-scanner (downloading ML model if not cached)..."
-	uv run --project agent-sec-cli agent-sec-cli scan-prompt warmup
-	@echo "🧪 Running prompt-scanner e2e tests..."
+test-prompt-scanner-e2e: ## Run daemon-backed prompt-scanner e2e tests
+	@echo "🧪 Running daemon-backed prompt-scanner e2e tests..."
 	uv run --project agent-sec-cli pytest tests/e2e/prompt-scanner/e2e_test.py
 
 .PHONY: test-e2e-rpm
@@ -199,7 +198,7 @@ build-all: build-sandbox build-cli build-openclaw-plugin build-hermes-plugin sta
 
 .PHONY: export-requirements
 export-requirements: ## Re-export agent-sec-cli/requirements.txt from uv.lock
-	cd agent-sec-cli && uv export --frozen --no-dev --no-hashes --no-emit-project -o requirements.txt
+	cd agent-sec-cli && uv export --frozen --no-dev --no-emit-project -o requirements.txt
 
 .PHONY: download-deps
 download-deps: ## Download ALL Python deps for agent-sec-cli (requires network)
@@ -207,6 +206,7 @@ download-deps: ## Download ALL Python deps for agent-sec-cli (requires network)
 	pip3 download --dest $(BUILD_DIR)/wheels/ --no-cache-dir \
 		--python-version 3.11.6 --only-binary=:all: \
 		--timeout 60 \
+		--require-hashes \
 		--index-url https://pypi.org/simple/ \
 		--extra-index-url https://download.pytorch.org/whl/cpu \
 		-r agent-sec-cli/requirements.txt
@@ -296,6 +296,7 @@ install-cli-venv: ## User: Create venv, install deps from uv.lock, install wheel
 	@echo "Creating symlink ..."
 	install -d -m 0755 $(BINDIR)
 	ln -sf $(VENV_DIR)/bin/agent-sec-cli $(BINDIR)/agent-sec-cli
+	ln -sf $(VENV_DIR)/bin/agent-sec-daemon $(BINDIR)/agent-sec-daemon
 
 .PHONY: install-skills
 install-skills: ## Install skill files to SKILLDIR
@@ -363,6 +364,7 @@ install-all-for-rpmbuild: install-cli-site install-cosh-hook install-openclaw-pl
 .PHONY: uninstall-cli-venv
 uninstall-cli-venv: ## Remove venv and agent-sec-cli symlink
 	rm -f $(DESTDIR)$(BINDIR)/agent-sec-cli
+	rm -f $(DESTDIR)$(BINDIR)/agent-sec-daemon
 	rm -rf $(DESTDIR)$(VENV_DIR)
 
 .PHONY: uninstall-cli-site

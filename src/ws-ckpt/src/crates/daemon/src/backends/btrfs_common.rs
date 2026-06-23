@@ -10,6 +10,76 @@ use ws_ckpt_common::{ChangeType, DiffEntry};
 
 use crate::util::unescape_proc_mount;
 
+/// init_workspace backup path (#673).
+pub fn backup_path_for(original_path: &str) -> String {
+    format!("{}.pre-init-bak", original_path.trim_end_matches('/'))
+}
+
+/// Roll back a failed init_workspace; `backup_owned=true` only when this init created the backup (#673).
+pub async fn cleanup_init_storage(
+    original_path: &str,
+    subvol_path: &Path,
+    snap_dir: &Path,
+    backup_owned: bool,
+) {
+    if backup_owned {
+        restore_original_from_backup(original_path).await;
+    } else if let Ok(meta) = tokio::fs::symlink_metadata(original_path).await {
+        if meta.file_type().is_symlink() {
+            let _ = tokio::fs::remove_file(original_path).await;
+        }
+    }
+    let _ = tokio::fs::remove_dir_all(snap_dir).await;
+    if let Err(e) = delete_subvolume(subvol_path).await {
+        error!("cleanup: failed to delete subvolume: {}", e);
+    }
+}
+
+/// Rename our own `.pre-init-bak` back over original_path; foreign data at original is preserved.
+async fn restore_original_from_backup(original_path: &str) {
+    let backup_path = backup_path_for(original_path);
+    match tokio::fs::symlink_metadata(&backup_path).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warn!(
+                "cleanup: backup {:?} unexpectedly missing; dropping leftover symlink at {}",
+                backup_path, original_path
+            );
+            if let Ok(meta) = tokio::fs::symlink_metadata(original_path).await {
+                if meta.file_type().is_symlink() {
+                    let _ = tokio::fs::remove_file(original_path).await;
+                }
+            }
+            return;
+        }
+        Err(e) => {
+            error!(
+                "cleanup: cannot stat backup {:?}: {}; aborting restore (manual recovery required)",
+                backup_path, e
+            );
+            return;
+        }
+    }
+
+    match tokio::fs::symlink_metadata(original_path).await {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            let _ = tokio::fs::remove_file(original_path).await;
+        }
+        Ok(meta) if meta.is_dir() => {
+            let _ = tokio::fs::remove_dir(original_path).await;
+        }
+        _ => {}
+    }
+
+    match tokio::fs::rename(&backup_path, original_path).await {
+        Ok(()) => info!("cleanup: restored {} from backup", original_path),
+        Err(e) => error!(
+            "cleanup: failed to restore {:?} -> {:?}: {}; backup retained for manual recovery",
+            backup_path, original_path, e
+        ),
+    }
+}
+
 /// Ensure the current kernel can mount btrfs.
 ///
 /// Checks `/proc/filesystems`; if absent, tries `modprobe btrfs` once and rechecks.
@@ -159,6 +229,38 @@ pub async fn diff_between_snapshots(snap_from: &Path, snap_to: &Path) -> Result<
     tokio::task::spawn_blocking(move || diff_between_snapshots_blocking(&snap_from, &snap_to))
         .await
         .context("diff task panicked")?
+}
+
+/// Diff a snapshot against the live (writable) workspace subvolume.
+///
+/// Creates a temporary read-only snapshot of `live_subvol` inside `snap_dir`,
+/// runs the diff, then removes the temporary snapshot regardless of outcome.
+pub async fn diff_against_live(
+    snap_from: &Path,
+    live_subvol: &Path,
+    snap_dir: &Path,
+) -> Result<Vec<DiffEntry>> {
+    use std::hash::{BuildHasher, Hasher, RandomState};
+
+    let h = RandomState::new().build_hasher().finish();
+    let tmp_snap = snap_dir.join(format!(".diff-tmp-{:06x}", h & 0xFFFFFF));
+
+    // Clean up stale temp snapshot from a prior crash before creating a new one.
+    if tmp_snap.exists() {
+        let _ = delete_subvolume(&tmp_snap).await;
+    }
+
+    create_snapshot(live_subvol, &tmp_snap, true)
+        .await
+        .context("failed to create temporary snapshot of live workspace for diff")?;
+
+    let result = diff_between_snapshots(snap_from, &tmp_snap).await;
+
+    if let Err(e) = delete_subvolume(&tmp_snap).await {
+        warn!(error = %e, path = %tmp_snap.display(), "failed to remove temp diff snapshot");
+    }
+
+    result
 }
 
 /// Blocking implementation of snapshot diff using `btrfs send | btrfs receive --dump`.
@@ -727,6 +829,31 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires root + btrfs filesystem"]
+    async fn diff_against_live_workspace() {
+        let base = PathBuf::from("/mnt/btrfs-workspace");
+        let src = base.join("test-diff-live-src");
+        let snap1 = base.join("test-diff-live-snap1");
+        // Cleanup prior
+        let _ = delete_subvolume(&snap1).await;
+        let _ = delete_subvolume(&src).await;
+
+        create_subvolume(&src).await.unwrap();
+        create_snapshot(&src, &snap1, true).await.unwrap();
+        // Modify the live subvolume after snapshot
+        tokio::fs::write(src.join("live-change.txt"), "world")
+            .await
+            .unwrap();
+
+        let entries = diff_against_live(&snap1, &src, &base).await.unwrap();
+        assert!(!entries.is_empty());
+
+        // Cleanup
+        let _ = delete_subvolume(&snap1).await;
+        let _ = delete_subvolume(&src).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root + btrfs filesystem"]
     async fn get_fs_usage() {
         let (total, used) = get_filesystem_usage(Path::new("/mnt/btrfs-workspace"))
             .await
@@ -778,6 +905,163 @@ mod tests {
     fn parse_btrfs_diff_output_empty() {
         let entries = parse_btrfs_diff_output("");
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn backup_path_for_appends_suffix() {
+        assert_eq!(backup_path_for("/tmp/ws"), "/tmp/ws.pre-init-bak");
+        assert_eq!(backup_path_for("/tmp/ws/"), "/tmp/ws.pre-init-bak");
+    }
+
+    /// Backup restores user data when symlink already replaced original (#673).
+    #[tokio::test]
+    async fn restore_swaps_symlink_back_to_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("ws");
+        let bak = tmp.path().join("ws.pre-init-bak");
+        let target = tmp.path().join("subvol");
+
+        tokio::fs::create_dir(&bak).await.unwrap();
+        tokio::fs::write(bak.join("foo.txt"), b"important")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(&target).await.unwrap();
+        tokio::fs::symlink(&target, &orig).await.unwrap();
+
+        restore_original_from_backup(orig.to_str().unwrap()).await;
+
+        assert!(!bak.exists(), "backup should be renamed away");
+        assert!(orig.is_dir(), "original must be a real dir again");
+        let payload = tokio::fs::read_to_string(orig.join("foo.txt"))
+            .await
+            .unwrap();
+        assert_eq!(payload, "important");
+    }
+
+    /// TOCTOU racer: an empty foreign dir appears at original between rename
+    /// and symlink. Backup must still restore (#673).
+    #[tokio::test]
+    async fn restore_clears_empty_racer_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("ws");
+        let bak = tmp.path().join("ws.pre-init-bak");
+
+        tokio::fs::create_dir(&bak).await.unwrap();
+        tokio::fs::write(bak.join("foo.txt"), b"keep")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(&orig).await.unwrap();
+
+        restore_original_from_backup(orig.to_str().unwrap()).await;
+
+        assert!(!bak.exists());
+        assert!(orig.join("foo.txt").exists(), "user data must be back");
+    }
+
+    /// Non-empty foreign dir at original must NOT be deleted; backup stays put.
+    #[tokio::test]
+    async fn restore_preserves_non_empty_foreign_dir_and_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("ws");
+        let bak = tmp.path().join("ws.pre-init-bak");
+
+        tokio::fs::create_dir(&bak).await.unwrap();
+        tokio::fs::write(bak.join("foo.txt"), b"keep")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(&orig).await.unwrap();
+        tokio::fs::write(orig.join("racer.txt"), b"foreign")
+            .await
+            .unwrap();
+
+        restore_original_from_backup(orig.to_str().unwrap()).await;
+
+        assert!(bak.exists(), "backup must be retained for manual recovery");
+        assert!(orig.join("racer.txt").exists());
+        assert!(bak.join("foo.txt").exists());
+    }
+
+    /// No backup -> noop, must not touch anything else.
+    #[tokio::test]
+    async fn restore_is_noop_when_backup_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("ws");
+        tokio::fs::create_dir(&orig).await.unwrap();
+        tokio::fs::write(orig.join("x"), b"y").await.unwrap();
+
+        restore_original_from_backup(orig.to_str().unwrap()).await;
+
+        assert!(orig.join("x").exists());
+    }
+
+    /// Foreign .pre-init-bak must not be restored when backup_owned=false (#673).
+    #[tokio::test]
+    async fn cleanup_does_not_restore_unowned_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("ws");
+        let bak = tmp.path().join("ws.pre-init-bak");
+        let subvol = tmp.path().join("subvol");
+        let snap = tmp.path().join("snap");
+
+        tokio::fs::create_dir(&bak).await.unwrap();
+        tokio::fs::write(bak.join("attacker.txt"), b"foreign")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(&orig).await.unwrap();
+        tokio::fs::write(orig.join("user.txt"), b"real")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(&snap).await.unwrap();
+
+        cleanup_init_storage(orig.to_str().unwrap(), &subvol, &snap, false).await;
+
+        assert!(orig.join("user.txt").exists(), "user data must remain");
+        assert!(
+            bak.join("attacker.txt").exists(),
+            "foreign backup not restored"
+        );
+        assert!(!snap.exists(), "snap dir cleaned");
+    }
+
+    /// cleanup with backup_owned=false drops a leftover symlink we created in step 6.
+    #[tokio::test]
+    async fn cleanup_drops_leftover_symlink_when_unowned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("ws");
+        let target = tmp.path().join("subvol");
+        let snap = tmp.path().join("snap");
+
+        tokio::fs::create_dir(&target).await.unwrap();
+        tokio::fs::symlink(&target, &orig).await.unwrap();
+        tokio::fs::create_dir(&snap).await.unwrap();
+
+        cleanup_init_storage(orig.to_str().unwrap(), &target, &snap, false).await;
+
+        assert!(!orig.exists(), "leftover symlink dropped");
+    }
+
+    /// backup_owned=true restores the backup over original (legit happy path).
+    #[tokio::test]
+    async fn cleanup_restores_owned_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = tmp.path().join("ws");
+        let bak = tmp.path().join("ws.pre-init-bak");
+        let target = tmp.path().join("subvol");
+        let snap = tmp.path().join("snap");
+
+        tokio::fs::create_dir(&bak).await.unwrap();
+        tokio::fs::write(bak.join("user.txt"), b"keep")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(&target).await.unwrap();
+        tokio::fs::symlink(&target, &orig).await.unwrap();
+        tokio::fs::create_dir(&snap).await.unwrap();
+
+        cleanup_init_storage(orig.to_str().unwrap(), &target, &snap, true).await;
+
+        assert!(orig.is_dir(), "original restored as real dir");
+        assert!(orig.join("user.txt").exists(), "user data back at original");
+        assert!(!bak.exists(), "backup consumed");
     }
 
     #[test]

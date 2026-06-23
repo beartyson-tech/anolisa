@@ -6,3 +6,11 @@ adapters/tokenless/manifest.json
 adapters/tokenless/openclaw/package.json
 adapters/tokenless/openclaw/openclaw.plugin.json
 adapters/tokenless/hermes/plugin.yaml
+adapters/tokenless/qoder/.qoder-plugin/plugin.json
+adapters/tokenless/claude-code/.claude-plugin/plugin.json
+adapters/tokenless/codex/.codex-plugin/plugin.json
+adapters/tokenless/qwencode/qwen-extension.json
+
+# Python bytecode cache
+__pycache__/
+*.pyc

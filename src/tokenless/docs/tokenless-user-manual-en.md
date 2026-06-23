@@ -2,7 +2,7 @@
 
 > LLM token optimization toolkit — Schema/Response Compression + Command Rewriting + TOON Format
 
-**Version**: 0.4.0  
+**Version**: 0.5.0  
 **Source**: https://code.alibaba-inc.com/Agentic-OS/Token-Less  
 **RPM Source**: https://code.alibaba-inc.com/alinux/tokenless  
 **System Requirements**: Rust 1.89+ (edition 2024), Linux (Alinux 4 recommended), just (build runner)
@@ -50,10 +50,14 @@
 
 ### 1.2 Supported Integrations
 
-| Integration | Command Rewriting | Response Compression | Schema Compression |
-|-------------|-------------------|---------------------|-------------------|
-| OpenClaw Plugin | ✅ | ✅ | ✅ |
-| Copilot Shell Hook | ✅ | ✅ | ✅ |
+| Integration | Command Rewriting | Response Compression | Schema Compression | TOON | Tool Ready |
+|-------------|-------------------|---------------------|-------------------|------|-----------|
+| OpenClaw Plugin | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Copilot Shell Hook | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Hermes Agent Plugin | ✅ | ✅ | ⏳ | ✅ | ✅ |
+| Qoder CLI Plugin | ✅ | ✅ | — | — | ✅ |
+| Claude Code Plugin | ✅ | ✅ | — | ✅ | ✅ |
+| Codex Plugin | ✅ | ✅ | — | ✅ | ✅ |
 
 ### 1.3 Architecture Overview
 
@@ -62,7 +66,7 @@ Token-Less/
 ├── crates/tokenless-schema/   # Core library: SchemaCompressor + ResponseCompressor
 ├── crates/tokenless-cli/      # CLI binary: tokenless command
 ├── crates/tokenless-stats/    # Stats recording library (SQLite)
-├── adapters/tokenless/        # FHS adapter bundle (manifest, common, openclaw, hermes)
+├── adapters/tokenless/        # FHS adapter bundle (cosh, openclaw, hermes, qoder, claude-code, codex)
 ├── third_party/rtk/           # RTK vendored source (justfile clone+patch)
 ├── third_party/patches/      # Patches for vendored third_party sources
 ├── Makefile                   # Unified build system
@@ -89,8 +93,8 @@ Recursively traverses JSON values and applies **7 compression rules** to reduce 
 
 | Rule | Name | Condition | Action | Default Threshold |
 |------|------|-----------|--------|-------------------|
-| R1 | String Truncation | Length > 512 bytes | Truncate at UTF-8 boundary, append `… (truncated)` | 512 bytes |
-| R2 | Array Truncation | Elements > 16 | Keep first 16, append `<... N more items truncated>` | 16 elements |
+| R1 | String Truncation | Length > 4096 bytes | Truncate at UTF-8 boundary, append `… (truncated)` | 4096 bytes |
+| R2 | Array Truncation | Elements > 32 | Keep first 32, append `<... N more items truncated>` | 32 elements |
 | R3 | Field Deletion | Key matches blacklist | Remove entire field | 7 fields |
 | R4 | Null Removal | Value is `null` | Delete from object/array | Enabled |
 | R5 | Empty Removal | Value is `""`/`[]`/`{}` | Delete from object/array | Enabled |
@@ -417,7 +421,7 @@ If OpenClaw plugin installation is needed after RPM installation, run:
 ```bash
 # Check OpenClaw plugin configuration
 cat ~/.openclaw/openclaw.json | jq '.plugins.allow'
-# Should contain "tokenless-openclaw"
+# Should contain "tokenless"
 
 # Check Copilot Shell Hook configuration
 cat ~/.copilot-shell/settings.json | jq '.hooks | keys'
@@ -611,6 +615,72 @@ Edit `openclaw.plugin.json`:
 | Response compression | `tool_result_persist` | Compress tool responses |
 | TOON compression | `tool_result_persist` | Sequential TOON encoding (if enabled) |
 
+### 5.5 Hermes Agent Plugin Configuration
+
+The Hermes plugin activates automatically when listed in `~/.hermes/config.yaml`:
+
+```yaml
+plugins:
+  enabled:
+    - tokenless
+```
+
+Or enable via CLI:
+
+```bash
+hermes plugins enable tokenless
+```
+
+The plugin hooks into three Hermes events:
+
+| Strategy | Event | Action |
+|---|---|---|
+| Tool Ready | `pre_tool_call` | Environment readiness pre-check with auto-fix and skip-retry feedback |
+| Command rewriting | `pre_tool_call` | Blocks original command, suggests RTK-rewritten version |
+| Response compression | `transform_tool_result` | Compresses tool results via `tokenless compress-response` |
+| TOON encoding | `transform_tool_result` | Pipeline step after response compression |
+
+> **Note**: Hermes's `pre_tool_call` hook can only block tool execution (not modify arguments), so command rewriting adds one extra round-trip.
+
+### 5.6 Qoder CLI Plugin Configuration
+
+Install via Makefile:
+
+```bash
+make qoder-install
+```
+
+Hooks are merged into `~/.qoder/settings.json` automatically. The plugin uses shared hook scripts from the common/hooks directory, referenced via the `${QODER_TOKENLESS_HOOKS}` variable.
+
+### 5.7 Claude Code Plugin Configuration
+
+Install via Makefile or the official `claude plugin` CLI:
+
+```bash
+make claude-code-install
+```
+
+The adapter exposes a local `anolisa` marketplace containing the `tokenless@anolisa` plugin. Claude Code v2 requires marketplace registration before plugin installation. The `run-hook.sh` dispatcher locates shared hook scripts via FHS paths.
+
+### 5.8 Codex Plugin Configuration
+
+Install via Makefile:
+
+```bash
+make codex-install
+```
+
+The plugin registers four Codex hooks:
+
+| Event | Action |
+|---|---|
+| `SessionStart` | Verifies tokenless CLI is installed (non-blocking) |
+| `PreToolUse` (tool-ready) | Environment readiness pre-check with auto-fix |
+| `PreToolUse` (rewrite) | Shell command rewriting via RTK |
+| `PostToolUse` | Response compression + TOON encoding + env error classification |
+
+> **Codex Protocol Constraint**: PostToolUse hooks cannot suppress the original tool output. The plugin injects a compressed summary as `additionalContext`.
+
 ---
 
 ## 6. Verification & Testing
@@ -769,7 +839,7 @@ ls -la ~/.local/share/anolisa/adapters/tokenless/common/hooks/
 
 | Problem | Solution |
 |---------|----------|
-| Plugin not loaded | Check plugin path: `~/.openclaw/plugins/tokenless-openclaw/` |
+| Plugin not loaded | Check plugin path: `~/.openclaw/plugins/tokenless/` |
 | RTK not working | Ensure `rtk` is in `$PATH`, check `rtk_enabled` configuration |
 | Compression not working | Check `response_compression_enabled` configuration |
 | TOON compression not working | Check `toon_compression_enabled` configuration, ensure `toon` binary in PATH |
@@ -807,11 +877,17 @@ jq --version
 | `make lint` | Run clippy checks |
 | `make fmt` | Format code |
 | `make clean` | Clean build artifacts |
-| `make adapter-install` | Install all adapters (cosh+openclaw+hermes) |
+| `make adapter-install` | Install all adapters (cosh+openclaw+hermes+qoder+claude-code+codex) |
 | `make openclaw-install` | Install OpenClaw plugin |
 | `make openclaw-uninstall` | Uninstall OpenClaw plugin |
 | `make hermes-install` | Install Hermes Agent plugin |
 | `make hermes-uninstall` | Uninstall Hermes Agent plugin |
+| `make qoder-install` | Install Qoder CLI plugin |
+| `make qoder-uninstall` | Uninstall Qoder CLI plugin |
+| `make claude-code-install` | Install Claude Code plugin |
+| `make claude-code-uninstall` | Uninstall Claude Code plugin |
+| `make codex-install` | Install Codex plugin |
+| `make codex-uninstall` | Uninstall Codex plugin |
 | `make cosh-extension-install` | Install Copilot Shell Hook |
 | `make cosh-extension-uninstall` | Uninstall Copilot Shell Hook |
 | `make setup` | Full installation: build + install + adapter deployment |
@@ -825,12 +901,16 @@ jq --version
 | CLI subcommand | `crates/tokenless-cli/src/main.rs` |
 | Stats recorder (SQLite) | `crates/tokenless-stats/src/recorder.rs` |
 | Stats record types | `crates/tokenless-stats/src/record.rs` |
-| OpenClaw plugin | `adapters/tokenless/openclaw/index.ts` |
+| OpenClaw plugin | `adapters/tokenless/openclaw/dist/index.js` |
 | OpenClaw plugin config | `adapters/tokenless/openclaw/openclaw.plugin.json` |
 | Copilot Hook — rewrite | `adapters/tokenless/common/hooks/rewrite_hook.py` |
 | Copilot Hook — compress response | `adapters/tokenless/common/hooks/compress_response_hook.py` |
 | Copilot Hook — compress schema | `adapters/tokenless/common/hooks/compress_schema_hook.py` |
 | Tool Ready hook | `adapters/tokenless/common/hooks/tool_ready_hook.sh` |
+| Hermes plugin | `adapters/tokenless/hermes/__init__.py` |
+| Qoder plugin hooks | `adapters/tokenless/qoder/hooks.json` |
+| Claude Code plugin | `adapters/tokenless/claude-code/hooks/run-hook.sh` |
+| Codex compression hook | `adapters/tokenless/codex/scripts/compress-response` |
 | Tool dependency spec | `adapters/tokenless/common/tool-ready-spec.json` |
 | Auto-fix script | `adapters/tokenless/common/tokenless-env-fix.sh` |
 | TOON codec (crates.io toon-format) | `toon-format` crate v0.4.6 |
@@ -851,8 +931,8 @@ All integration paths use **fail-open** strategy:
 
 | Parameter | Default | Builder Method |
 |-----------|---------|----------------|
-| `truncate_strings_at` | 512 | `with_truncate_strings_at(len)` |
-| `truncate_arrays_at` | 16 | `with_truncate_arrays_at(len)` |
+| `truncate_strings_at` | 4096 | `with_truncate_strings_at(len)` |
+| `truncate_arrays_at` | 32 | `with_truncate_arrays_at(len)` |
 | `drop_nulls` | true | `with_drop_nulls(bool)` |
 | `drop_empty_fields` | true | `with_drop_empty_fields(bool)` |
 | `max_depth` | 8 | `with_max_depth(depth)` |

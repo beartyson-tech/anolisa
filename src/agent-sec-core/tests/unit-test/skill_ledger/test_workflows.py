@@ -27,7 +27,10 @@ from agent_sec_cli.skill_ledger.core.file_hasher import (
     compute_file_hashes,
     diff_file_hashes,
 )
-from agent_sec_cli.skill_ledger.errors import SignatureInvalidError
+from agent_sec_cli.skill_ledger.errors import (
+    KeyNotFoundError,
+    SignatureInvalidError,
+)
 from agent_sec_cli.skill_ledger.signing.base import SigningBackend
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import (
@@ -76,6 +79,36 @@ class InMemoryEd25519Backend(SigningBackend):
 
     def get_public_key_fingerprint(self) -> str:
         return self._fingerprint
+
+
+class VerifyFalseBackend(SigningBackend):
+    """Signing backend wrapper whose verify method returns ``False``."""
+
+    def __init__(self, delegate: SigningBackend):
+        self._delegate = delegate
+
+    @property
+    def name(self) -> str:
+        return self._delegate.name
+
+    def generate_keys(self, passphrase=None):
+        return self._delegate.generate_keys(passphrase)
+
+    def sign(self, data: bytes) -> tuple[str, str]:
+        return self._delegate.sign(data)
+
+    def verify(self, data: bytes, signature_b64: str, fingerprint: str) -> bool:
+        return False
+
+    def get_public_key_fingerprint(self) -> str:
+        return self._delegate.get_public_key_fingerprint()
+
+
+class KeyMissingVerifyBackend(VerifyFalseBackend):
+    """Signing backend wrapper that raises missing-key errors on verify."""
+
+    def verify(self, data: bytes, signature_b64: str, fingerprint: str) -> bool:
+        raise KeyNotFoundError("/tmp/missing-test-key.pub")
 
 
 # ---------------------------------------------------------------------------
@@ -136,21 +169,30 @@ class TestCheckStateMachine(SkillDirTestCase):
     Each represents a distinct security posture.
     """
 
-    def test_no_manifest_creates_one_returns_none(self):
-        """First check on a fresh skill → auto-create manifest, status=none."""
+    def test_no_manifest_returns_none_read_only(self):
+        """First check on a fresh skill is read-only and returns status=none."""
         result = check(self.skill_dir, self.backend)
         self.assertEqual(result["status"], "none")
-        # .skill-meta/latest.json should now exist
+        # check is read-only; scan/certify are responsible for creating versions.
         latest = os.path.join(self.skill_dir, ".skill-meta", "latest.json")
-        self.assertTrue(os.path.isfile(latest))
-        # Enriched metadata must be present
+        self.assertFalse(os.path.exists(latest))
         self.assertEqual(result["skillName"], "test-skill")
-        self.assertIn("versionId", result)
-        self.assertIn("createdAt", result)
-        self.assertIn("updatedAt", result)
-        self.assertIn("fileCount", result)
-        self.assertIn("manifestHash", result)
-        self.assertIsInstance(result["fileCount"], int)
+        self.assertIsNone(result["versionId"])
+        self.assertIsNone(result["createdAt"])
+        self.assertIsNone(result["updatedAt"])
+        self.assertIsNone(result["manifestHash"])
+        self.assertIsNone(result["fileCount"])
+
+    def test_no_manifest_does_not_hash_files(self):
+        """A fresh skill returns none without walking and hashing the tree."""
+        with patch(
+            "agent_sec_cli.skill_ledger.core.checker.compute_file_hashes",
+            side_effect=AssertionError("fresh skill should not be hashed"),
+        ):
+            result = check(self.skill_dir, self.backend)
+
+        self.assertEqual(result["status"], "none")
+        self.assertIsNone(result["fileCount"])
 
     def test_unchanged_after_certify_pass(self):
         """certify with all-pass findings → check returns pass with enriched metadata."""
@@ -170,8 +212,10 @@ class TestCheckStateMachine(SkillDirTestCase):
 
     def test_drifted_after_file_change(self):
         """Modifying a skill file → check returns drifted."""
-        # First, establish a signed manifest
-        check(self.skill_dir, self.backend)
+        findings_path = self._write_findings(
+            [{"rule": "r1", "level": "pass", "message": "ok"}]
+        )
+        certify(self.skill_dir, self.backend, findings_path=findings_path)
         # Modify a file
         self._write_file("run.sh", "#!/bin/bash\necho MODIFIED\n")
         result = check(self.skill_dir, self.backend)
@@ -180,7 +224,10 @@ class TestCheckStateMachine(SkillDirTestCase):
 
     def test_drifted_on_file_added(self):
         """Adding a new file → check returns drifted with added list."""
-        check(self.skill_dir, self.backend)
+        findings_path = self._write_findings(
+            [{"rule": "r1", "level": "pass", "message": "ok"}]
+        )
+        certify(self.skill_dir, self.backend, findings_path=findings_path)
         self._write_file("new_file.py", "print('hello')\n")
         result = check(self.skill_dir, self.backend)
         self.assertEqual(result["status"], "drifted")
@@ -188,7 +235,10 @@ class TestCheckStateMachine(SkillDirTestCase):
 
     def test_drifted_on_file_removed(self):
         """Removing a file → check returns drifted with removed list."""
-        check(self.skill_dir, self.backend)
+        findings_path = self._write_findings(
+            [{"rule": "r1", "level": "pass", "message": "ok"}]
+        )
+        certify(self.skill_dir, self.backend, findings_path=findings_path)
         os.remove(os.path.join(self.skill_dir, "run.sh"))
         result = check(self.skill_dir, self.backend)
         self.assertEqual(result["status"], "drifted")
@@ -196,12 +246,15 @@ class TestCheckStateMachine(SkillDirTestCase):
 
     def test_tampered_manifest_hash(self):
         """Directly editing the manifest JSON → tampered (hash mismatch)."""
-        check(self.skill_dir, self.backend)  # creates unsigned baseline manifest
+        findings_path = self._write_findings(
+            [{"rule": "r1", "level": "pass", "message": "ok"}]
+        )
+        certify(self.skill_dir, self.backend, findings_path=findings_path)
         latest = os.path.join(self.skill_dir, ".skill-meta", "latest.json")
         with open(latest, "r") as f:
             data = json.load(f)
         # Tamper: change scanStatus without re-hashing
-        data["scanStatus"] = "pass"
+        data["scanStatus"] = "deny"
         with open(latest, "w") as f:
             json.dump(data, f)
         result = check(self.skill_dir, self.backend)
@@ -209,7 +262,6 @@ class TestCheckStateMachine(SkillDirTestCase):
 
     def test_tampered_wrong_key_signature(self):
         """Signing with a different key → tampered (signature mismatch)."""
-        # certify first to create a signed manifest (auto-create is unsigned)
         findings_path = self._write_findings(
             [{"rule": "r1", "level": "pass", "message": "ok"}]
         )
@@ -232,6 +284,30 @@ class TestCheckStateMachine(SkillDirTestCase):
             json.dump(data, f)
         result = check(self.skill_dir, self.backend)
         self.assertEqual(result["status"], "tampered")
+
+    def test_tampered_when_verify_returns_false(self):
+        """A backend returning False from verify is treated as tampered."""
+        findings_path = self._write_findings(
+            [{"rule": "r1", "level": "pass", "message": "ok"}]
+        )
+        certify(self.skill_dir, self.backend, findings_path=findings_path)
+
+        result = check(self.skill_dir, VerifyFalseBackend(self.backend))
+
+        self.assertEqual(result["status"], "tampered")
+        self.assertEqual(result["reason"], "signature verification returned false")
+
+    def test_tampered_when_verification_key_is_missing(self):
+        """Missing public keys fail closed instead of crashing check."""
+        findings_path = self._write_findings(
+            [{"rule": "r1", "level": "pass", "message": "ok"}]
+        )
+        certify(self.skill_dir, self.backend, findings_path=findings_path)
+
+        result = check(self.skill_dir, KeyMissingVerifyBackend(self.backend))
+
+        self.assertEqual(result["status"], "tampered")
+        self.assertIn("Signing key not found", result["reason"])
 
     def test_deny_status_passthrough(self):
         """certify with deny findings → check returns deny."""
@@ -429,8 +505,6 @@ class TestCertifyWorkflow(SkillDirTestCase):
 
     def test_scan_mode_no_crash(self):
         """Scan runs default built-in scanners."""
-        # First create a manifest
-        check(self.skill_dir, self.backend)
         result = scan_skill(self.skill_dir, self.backend)
         self.assertIn("versionId", result)
         self.assertEqual(result["scanStatus"], "pass")
@@ -514,6 +588,45 @@ class TestAuditChainIntegrity(SkillDirTestCase):
         error_msgs = [e["error"] for e in result["errors"]]
         self.assertTrue(any("manifestHash" in msg for msg in error_msgs))
 
+    def test_corrupted_version_manifest_does_not_abort_audit(self):
+        """Malformed version JSON is reported while later versions are still audited."""
+        findings_path = self._write_findings(
+            [
+                {"rule": "r1", "level": "pass", "message": "ok"},
+            ]
+        )
+        certify(self.skill_dir, self.backend, findings_path=findings_path)
+        self._write_file("run.sh", "#!/bin/bash\necho v2\n")
+        certify(self.skill_dir, self.backend, findings_path=findings_path)
+
+        v1_file = os.path.join(
+            self.skill_dir,
+            ".skill-meta",
+            "versions",
+            "v000001.json",
+        )
+        with open(v1_file, "w") as f:
+            f.write("{not-json")
+
+        result = audit(self.skill_dir, self.backend)
+
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["versions_checked"], 2)
+        errors = result["errors"]
+        self.assertTrue(
+            any(
+                error["versionId"] == "v000001" and "corrupted" in error["error"]
+                for error in errors
+            )
+        )
+        self.assertTrue(
+            any(
+                error["versionId"] == "v000002"
+                and "prior version manifest" in error["error"]
+                for error in errors
+            )
+        )
+
     def test_broken_chain_detected(self):
         """Corrupting previousManifestSignature → audit detects chain break."""
         findings_path = self._write_findings(
@@ -557,6 +670,21 @@ class TestAuditChainIntegrity(SkillDirTestCase):
         result = audit(self.skill_dir, self.backend)
         self.assertTrue(result["valid"])
         self.assertEqual(result["versions_checked"], 0)
+
+    def test_signature_verify_false_is_invalid(self):
+        """A backend returning False from verify is reported as invalid."""
+        findings_path = self._write_findings(
+            [{"rule": "r1", "level": "pass", "message": "ok"}]
+        )
+        certify(self.skill_dir, self.backend, findings_path=findings_path)
+
+        result = audit(self.skill_dir, VerifyFalseBackend(self.backend))
+
+        self.assertFalse(result["valid"])
+        error_msgs = [e["error"] for e in result["errors"]]
+        self.assertTrue(
+            any("signature verification returned false" in msg for msg in error_msgs)
+        )
 
 
 # ---------------------------------------------------------------------------

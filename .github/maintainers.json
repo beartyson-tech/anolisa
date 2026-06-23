@@ -64,6 +64,9 @@
             "maintainers": [
                 {
                     "github": "chengshuyi"
+                },
+                {
+                    "github": "jfeng18"
                 }
             ]
         },
@@ -80,6 +83,25 @@
             "maintainers": [
                 {
                     "github": "shiloong"
+                }
+            ]
+        },
+        {
+            "label": "component:anolisa",
+            "maintainers": [
+                {
+                    "github": "kongche-jbw"
+                },
+                {
+                    "github": "ikunkun-sys"
+                }
+            ]
+        },
+        {
+            "label": "component:skillfs",
+            "maintainers": [
+                {
+                    "github": "kongche-jbw"
                 }
             ]
         }

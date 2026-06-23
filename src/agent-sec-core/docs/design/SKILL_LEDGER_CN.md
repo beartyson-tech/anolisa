@@ -17,7 +17,7 @@ AI Agent 通过加载 Skill（结构化指令 + 辅助脚本）扩展能力。Sk
 
 - 不替代操作系统级沙箱或进程隔离
 - 不实现运行时行为监控（仅静态内容检查 + 签名验证）
-- 不提供用户自定义的 hook 执行策略；当前版本采用统一默认策略
+- 不实现按 skill/来源区分的细粒度 activation 策略；当前仅支持全局 `activationPolicy`
 
 ---
 
@@ -47,14 +47,14 @@ AI Agent 通过加载 Skill（结构化指令 + 辅助脚本）扩展能力。Sk
 │                                                       │
 │  ~/.local/share/agent-sec/skill-ledger/                     │
 │    key.enc (私钥)     ← scan/certify 签名                   │
-│    check 首次无 manifest → 未签名 baseline（无需私钥）       │
+│    check 只读状态；scan/certify 创建签名版本与 snapshot       │
 │    key.pub (公钥)     ← check 验签                     │
 └───────────────────────────────────────────────────────┘
 ```
 
 **组件职责**：
 
-- **skill-ledger CLI**：核心基础设施。提供 `init`（初始化密钥并可为已覆盖 Skill 建立快速扫描 baseline）、`scan`（运行内置快速扫描器并签名入账）、`check`（hook 调用，读 JSON + 验签 + 比哈希 + 输出状态）、`certify`（导入外部 findings 并签名）等子命令。`scan` / `certify` 写入的 manifest 经 Ed25519 数字签名保护，防止篡改；`check` 在无 manifest 时只创建未签名 baseline，用于后续 drift 检测。确定性逻辑不依赖 LLM，不可被 prompt injection 绕过。
+- **skill-ledger CLI**：核心基础设施。提供 `init`（初始化密钥并可为已覆盖 Skill 建立快速扫描 baseline）、`scan`（运行内置快速扫描器并签名入账）、`check`（hook 调用，只读检查 JSON + 验签 + 比哈希 + 输出状态）、`certify`（导入外部 findings 并签名）等子命令。`scan` / `certify` 写入的 manifest 经 Ed25519 数字签名保护，防止篡改；`check` 在无 manifest 时返回 `none`，不创建版本或 snapshot。确定性逻辑不依赖 LLM，不可被 prompt injection 绕过。
 - **Scanner Registry**：可扩展扫描框架。通过配置注册扫描器（`builtin`/`cli`/`skill`/`api` 四种调用类型）和结果解析器（将异构扫描输出归一化为统一 `NormalizedFinding` 格式）。本版本默认注册 `skill-vetter`（`type: "skill"`，由 Agent 深度扫描后通过 `certify --findings` 消费）、`code-scanner` 和 `static-scanner`（均为 `type: "builtin"`，可由 `scan` 自动调用）。当前仅实现 `findings-array` parser；`cli`/`api` adapter 及其它 parser 类型为预留扩展点。旧名称 `skill-code-scanner`、`cisco-static-scanner` 仅作为兼容 alias 读取，不再作为公开名称展示或写入新 manifest。
 - **skill-ledger Skill**：一个 Skill，三个阶段。Phase 1 做环境准备与状态查看；Phase 2 默认执行快速扫描认证（`scan` 调用内置 `code-scanner` 与 `static-scanner`）；Phase 3 在用户显式要求或确认后执行 Agent 驱动深度扫描（`skill-vetter`），再用 `certify --findings ... --delete-findings` 写入版本链。
 - **Hook 层**：门禁。调用 `skill-ledger check`，默认 `pass` 静默放行、非 `pass` 告警放行；宿主配置开启阻断后，可对指定状态直接阻断。CLI 不可用、执行失败、超时或输出不可解析时保持 fail-open。
@@ -71,7 +71,7 @@ AI Agent 通过加载 Skill（结构化指令 + 辅助脚本）扩展能力。Sk
 └── .skill-meta/
     ├── latest.json            # 最新 manifest（certify 后含数字签名）
     ├── versions/
-    │   ├── v000001.json       # 首版 manifest（check baseline 可未签名）
+    │   ├── v000001.json       # 首版 manifest（由 scan/certify/init baseline 签名创建）
     │   ├── v000001.snapshot/  # 首版文件快照
     │   ├── v000002.json
     │   ├── v000002.snapshot/
@@ -188,6 +188,7 @@ class SigningBackend(Protocol):
 ```jsonc
 {
   "signingBackend": "ed25519",  // 当前实现固定使用 ed25519；该字段保留给未来扩展
+  "activationPolicy": "latest_scanned", // pass_only | pass_warn_only | latest_scanned
   "enableDefaultSkillDirs": true,   // 默认 true；false 时仅使用 managedSkillDirs
   "managedSkillDirs": [
     "/opt/custom-skills/*",         // glob 匹配目录下所有 skill
@@ -242,9 +243,9 @@ class SigningBackend(Protocol):
 
 **默认值**：内置三个默认目录（`~/.openclaw/skills/*`、`~/.copilot-shell/skills/*`、`/usr/share/anolisa/skills/*`），覆盖 OpenClaw、copilot-shell 和系统级 skill。
 
-**合并策略**：默认目录默认启用，由 `enableDefaultSkillDirs` 控制；`managedSkillDirs` 存放 skill-ledger 动态管理或用户额外配置的目录，不再兼容旧的 `skillDirs` 字段。解析时默认目录在前，`managedSkillDirs` 在后，自动去重。`scanners` 按 `name` 合并，用户配置可覆盖同名扫描器；`signingBackend` 当前会被读取到配置摘要中，但不会改变实际签名后端。
+**合并策略**：默认目录默认启用，由 `enableDefaultSkillDirs` 控制；`managedSkillDirs` 存放 skill-ledger 动态管理或用户额外配置的目录，不再兼容旧的 `skillDirs` 字段。解析时默认目录在前，`managedSkillDirs` 在后，自动去重。`scanners` 按 `name` 合并，用户配置可覆盖同名扫描器；`activationPolicy` 是全局运行态策略；`signingBackend` 当前会被读取到配置摘要中，但不会改变实际签名后端。
 
-**自动记忆**：用户对某个 skill 执行 `check`、`scan` 或 `certify` 时，若该 skill 目录不在当前有效目录中，会自动追加到 `managedSkillDirs`。若父目录下有 ≥2 个包含 `SKILL.md` 的兄弟 skill，则追加父目录 glob（`parent/*`）而非单个路径。追加后自动压缩（compact）：若某 glob 已覆盖某个单目录条目，则移除冗余的单目录条目。
+**自动记忆**：用户对某个 skill 执行 `scan` 或 `certify` 时，若该 skill 目录不在当前有效目录中，会自动追加到 `managedSkillDirs`。`check` 是只读状态检查，不会写配置、manifest 或 snapshot。若父目录下有 ≥2 个包含 `SKILL.md` 的兄弟 skill，则追加父目录 glob（`parent/*`）而非单个路径。追加后自动压缩（compact）：若某 glob 已覆盖某个单目录条目，则移除冗余的单目录条目。
 
 #### 默认后端：Ed25519 + 加密密钥文件
 
@@ -309,6 +310,7 @@ GPG 仍是**分发签名**（sign-skill.sh → trusted-keys → verifier.py）�
 | `scan` | 运行内置快速扫描器并签名写入 manifest | 已实现 |
 | `check` | 状态检查（供 hook 调用） | 已实现 |
 | `certify` | 导入外部 findings 并签名写入 manifest | 已实现 |
+| 内部 resolver | 写入运行态 activation（daemon 内部调用，不提供 CLI） | 已实现 |
 | `status` | 查询整体安全状况（系统级概览） | 已实现 |
 | `list-scanners` | 列出已注册扫描器 | 已实现 |
 | `audit` | 深度校验版本链完整性 | 已实现 |
@@ -331,12 +333,12 @@ GPG 仍是**分发签名**（sign-skill.sh → trusted-keys → verifier.py）�
 
 判定流程（按优先级）：
 
-1. **无 manifest** → 自动创建未签名 baseline（`scanStatus: "none"`，写入 `latest.json` 和首个 snapshot）→ 返回 `none`
+1. **无 manifest** → 返回 `none`；不创建版本、manifest 或 snapshot
 2. **fileHashes 不匹配** → 返回 `drifted`（附 added/removed/modified 详情）
 3. **签名验证失败** → 返回 `tampered`
 4. **签名有效** → 按 `scanStatus` 返回 `deny` / `warn` / `none` / `pass`
 
-输出为单行 JSON，hook 直接解析。首次 `check` 不需要私钥，也不会签名；后续已签名 manifest 的验签仅需公钥。
+输出为单行 JSON，hook 直接解析。`check` 始终只读，不需要私钥，也不会签名；后续已签名 manifest 的验签仅需公钥。
 
 > **关键设计：fileHashes 先于签名验证。** 文件已变更时无论签名有效与否均为 `drifted`。`tampered` 仅在内容未变但 manifest 被伪造时触发（如 `scanStatus` 被篡改），是真正的元数据安全事件。
 
@@ -365,9 +367,44 @@ GPG 仍是**分发签名**（sign-skill.sh → trusted-keys → verifier.py）�
 
 | 阶段 | 职责 | 关键行为 |
 |------|------|---------|
-| **一：对齐** | 确保 manifest 与磁盘文件一致 | 无 manifest、drifted 或 tampered 时按当前文件创建新版本；首次 `check` 只创建未签名 baseline |
+| **一：对齐** | 确保 manifest 与磁盘文件一致 | 无 manifest、drifted 或 tampered 时按当前文件创建新版本；`check` 只读，不创建版本 |
 | **二：导入** | 获取扫描结果 | 读取外部 findings 文件，输出经 parser 归一化为 `NormalizedFinding[]` |
 | **三：签名** | 更新 manifest 并签名 | 合并 scan 条目 → 聚合 `scanStatus`（取最严重级别）→ 重算 `manifestHash` → Ed25519 签名 → 原子写入 |
+
+**内部 activation resolver** — 写入运行态 activation
+
+Skill Ledger 不提供面向用户或 SkillFS 的 `resolve` CLI；activation refresh 是 daemon 内部职责。resolver 根据当前版本链和 `activationPolicy` 选择可运行 snapshot，并原子写入 `.skill-meta/activation.json`，同时尽力同步写入 skill 目录 xattr `user.agent_sec.skill_ledger.activation`：
+
+```json
+{
+  "schemaVersion": 1,
+  "target": ".skill-meta/versions/v000002.snapshot"
+}
+```
+
+策略允许值：
+
+| policy | 激活规则 |
+|--------|----------|
+| `pass_only` | 只激活签名有效、manifest hash 有效、snapshot 完整、`scanStatus=pass` 的最新 snapshot。 |
+| `pass_warn_only` | 激活签名有效、manifest hash 有效、snapshot 完整、且 `scanStatus in {"pass","warn"}` 的最新 snapshot；`deny` snapshot 会被跳过。 |
+| `latest_scanned` | 激活签名有效、manifest hash 有效、snapshot 完整、且 `scanStatus in {"pass","warn","deny"}` 的最新 snapshot。 |
+
+`latest_scanned` 中的最新版本仍然是 latest signed snapshot，不是 source/current 工作区；`scanStatus=none` 不会被激活。若没有符合策略的版本，则写入：
+
+```json
+{
+  "schemaVersion": 1,
+  "target": null
+}
+```
+
+resolver 始终只激活 snapshot，不激活 source/current 工作区。当前工作区处于
+`drifted`、`tampered` 或尚未扫描的 `none` 状态时，不会被直接暴露；是否暴露
+历史 `warn` / `deny` snapshot 由 `activationPolicy` 决定。`pass_warn_only` 会暴露
+`warn` 历史 snapshot，但在最新版本为 `deny` 时回退到更早的 `pass` / `warn`
+snapshot；若没有符合策略的版本则写入 `target: null`。daemon 在收到 SkillFS
+变更通知、扫描完成或重启 reconcile 时调用该 resolver。
 
 **`skill-ledger set-policy <skill_dir> --policy <allow|block|warning>`** — 设置 skill 执行策略（预留接口）
 
@@ -393,7 +430,7 @@ GPG 仍是**分发签名**（sign-skill.sh → trusted-keys → verifier.py）�
 
 **`skill-ledger audit <skill_dir>`** — 深度校验版本链完整性
 
-遍历 `versions/` 逐版本验证 manifestHash、签名、`previousManifestSignature` 链接完整性。可选 `--verify-snapshots` 校验快照文件哈希。输出结构化校验结果。
+遍历 `versions/` 逐版本验证 manifestHash、签名、`previousManifestSignature` 链接完整性。可选 `--verify-snapshots` 校验快照文件哈希，并拒绝 snapshot 中的 symlink、特殊文件和 `.skill-meta` / `.git` 元数据路径。输出结构化校验结果。
 
 ### 扫描能力架构
 

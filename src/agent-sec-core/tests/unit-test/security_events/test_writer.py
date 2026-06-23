@@ -627,6 +627,118 @@ class TestWriterFireAndForget:
         writer = SecurityEventWriter(path="/nonexistent/path/events.jsonl")
         writer.write(_make_event())
 
+    def test_write_serialization_failure_does_not_emit_stderr(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        path = tmp_path / "events.jsonl"
+        writer = JsonlEventWriter(path=path)
+
+        writer.write({"bad": object()})
+
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        assert not path.exists()
+
+    def test_write_or_raise_surfaces_serialization_failure_without_stderr(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        path = tmp_path / "events.jsonl"
+        writer = JsonlEventWriter(path=path)
+
+        with pytest.raises(TypeError):
+            writer.write_or_raise({"path": Path("/tmp/x")})
+
+        captured = capsys.readouterr()
+        assert captured.err == ""
+
+    def test_write_invokes_on_error_for_io_failure(self, tmp_path: Path) -> None:
+        """When the underlying append fails (e.g. ENOSPC simulated via patched
+        ``_append_record``), the configured ``on_error`` callback is invoked
+        with the exception. See PR #651 review #1.
+        """
+        captured: list[Exception] = []
+
+        def _capture(exc: Exception) -> None:
+            captured.append(exc)
+
+        path = tmp_path / "events.jsonl"
+        writer = JsonlEventWriter(path=path, on_error=_capture)
+
+        boom = OSError("no space left on device")
+
+        def _raising(_record: object) -> None:
+            raise boom
+
+        writer._append_record = _raising  # type: ignore[assignment]
+        writer.write({"k": "v"})
+
+        assert captured == [boom]
+
+    def test_write_invokes_on_error_for_rotation_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: list[Exception] = []
+        path = tmp_path / "events.jsonl"
+        path.write_text("x" * 20, encoding="utf-8")
+        writer = JsonlEventWriter(path=path, max_bytes=1, on_error=captured.append)
+        boom = OSError("cannot rotate")
+
+        def _raise_move(_src: object, _dst: object) -> None:
+            raise boom
+
+        monkeypatch.setattr(
+            "agent_sec_cli.security_events.writer.shutil.move",
+            _raise_move,
+        )
+
+        writer.write({"k": "v"})
+
+        assert captured == [boom]
+        assert path.exists()
+
+    def test_cleanup_invokes_on_error_for_unlink_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: list[Exception] = []
+        path = tmp_path / "events.jsonl"
+        backup = tmp_path / "events.jsonl.20260101-120000.000"
+        backup.write_text("old\n", encoding="utf-8")
+        writer = JsonlEventWriter(path=path, backup_count=0, on_error=captured.append)
+        boom = OSError("cannot unlink")
+
+        def _raise_unlink(_path: Path) -> None:
+            raise boom
+
+        monkeypatch.setattr(Path, "unlink", _raise_unlink)
+
+        writer._cleanup_old_backups()
+
+        assert captured == [boom]
+
+    def test_write_swallows_on_error_callback_failure(self, tmp_path: Path) -> None:
+        """A misbehaving ``on_error`` (e.g. raises) must not surface to the
+        caller — the writer's fire-and-forget contract is preserved.
+        """
+
+        def _bad_callback(_exc: Exception) -> None:
+            raise RuntimeError("on_error itself blew up")
+
+        path = tmp_path / "events.jsonl"
+        writer = JsonlEventWriter(path=path, on_error=_bad_callback)
+        writer._append_record = lambda _r: (_ for _ in ()).throw(  # type: ignore[assignment]
+            OSError("disk full")
+        )
+        writer.write({"k": "v"})  # must not raise
+
+    def test_write_without_on_error_remains_silent(self, tmp_path: Path) -> None:
+        """No callback configured (e.g. cli.jsonl handler) → silent drop, no recursion."""
+        path = tmp_path / "events.jsonl"
+        writer = JsonlEventWriter(path=path)
+        writer._append_record = lambda _r: (_ for _ in ()).throw(  # type: ignore[assignment]
+            OSError("disk full")
+        )
+        writer.write({"k": "v"})  # must not raise
+
 
 class TestWriterThreadSafety:
     def test_concurrent_writes(self, tmp_path: Path) -> None:

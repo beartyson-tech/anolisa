@@ -5,17 +5,17 @@
 // Exposes a `SslSniff` struct with a builder-style API.
 
 use crate::config;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use libbpf_rs::{
-    Link, MapHandle, RingBufferBuilder, UprobeOpts,
+    Link, RingBufferBuilder, UprobeOpts,
     skel::{OpenSkel, SkelBuilder},
 };
-use std::os::fd::AsFd;
 use procfs::process::Process;
+
+use super::shared_maps::{MapKind, SharedMaps};
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::Write,
     mem::{self, MaybeUninit},
     path::Path,
     slice,
@@ -28,6 +28,12 @@ use std::{
 };
 
 // ─── Generated skeleton ───────────────────────────────────────────────────────
+#[allow(
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code,
+    non_snake_case
+)]
 pub mod bpf {
     include!(concat!(env!("OUT_DIR"), "/sslsniff.skel.rs"));
     include!(concat!(env!("OUT_DIR"), "/sslsniff.rs"));
@@ -39,7 +45,7 @@ const MAX_BUF_SIZE: usize = bpf::MAX_BUF_SIZE as usize;
 const POLL_TIMEOUT_MS: u64 = 100;
 
 /// User-space SslEvent - lightweight version of BPF probe_SSL_data_t
-/// 
+///
 /// Unlike the BPF version which has a 512KB fixed-size buffer, this struct
 /// only stores the actual data received, significantly reducing memory usage.
 #[derive(Debug, Clone)]
@@ -60,32 +66,82 @@ pub struct SslEvent {
 }
 
 impl SslEvent {
-    /// Create SslEvent from BPF raw event, copying only the actual data
+    /// Create SslEvent from a raw ring-buffer sample of VARIABLE length.
     ///
-    /// Note: BPF timestamp_ns is from bpf_ktime_get_ns() which returns
-    /// nanoseconds since system boot. We convert it to Unix timestamp.
-    pub fn from_bpf(raw: &bpf::probe_SSL_data_t) -> Self {
-        let buf_size = raw.buf_size as usize;
-        let buf = raw.buf[..buf_size.min(MAX_BUF_SIZE)].to_vec();
-
-        // Convert ktime (nanoseconds since boot) to Unix timestamp
-        let ktime_ns = raw.timestamp_ns as u64;
-        let unix_ts_ns = config::ktime_to_unix_ns(ktime_ns);
-
-        Self {
-            source: raw.source as u32,
-            timestamp_ns: unix_ts_ns,
-            delta_ns: raw.delta_ns as u64,
-            pid: raw.pid as u32,
-            tid: raw.tid as u32,
-            uid: raw.uid as u32,
-            len: raw.len as u32,
-            rw: raw.rw,
-            comm: Self::parse_comm(&raw.comm),
-            buf,
-            is_handshake: raw.is_handshake != 0,
-            ssl_ptr: raw.ssl_ptr as u64,
+    /// SSL records are tiered: the BPF side reserves only
+    /// `offsetof(probe_SSL_data_t, buf) + <tier>` bytes, so a sample is the
+    /// header prefix followed by `buf_size` payload bytes — NOT the full
+    /// fixed-size struct. We therefore (1) gate on the header size, (2) read each
+    /// scalar field from the prefix at its real (bindgen) offset — NOT via a
+    /// full-struct cast, which is UB on a short sample and would also put the
+    /// 4 MiB `buf` array on the stack if materialized — and (3) slice the payload
+    /// by the `buf_size` FIELD, never by `data.len()` (which over-counts for any
+    /// still-full-size record such as tcpsniff's 4 MiB reservation).
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        type R = bpf::probe_SSL_data_t;
+        let hdr = mem::offset_of!(R, buf);
+        if data.len() < hdr {
+            return None;
         }
+        // Build the byte arrays directly (no `.unwrap()`; see AGENTS.md §0). Every `off`
+        // is a header field offset < `hdr`, and the guard above proves `data.len() >= hdr`,
+        // so each index is in-bounds (`buf` is the last struct member).
+        let u32_at = |off: usize| {
+            u32::from_ne_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+        };
+        let u64_at = |off: usize| {
+            u64::from_ne_bytes([
+                data[off],
+                data[off + 1],
+                data[off + 2],
+                data[off + 3],
+                data[off + 4],
+                data[off + 5],
+                data[off + 6],
+                data[off + 7],
+            ])
+        };
+        let i32_at = |off: usize| {
+            i32::from_ne_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+        };
+
+        let len = u32_at(mem::offset_of!(R, len)) as usize;
+        let buf_size = (u32_at(mem::offset_of!(R, buf_size)) as usize)
+            .min(MAX_BUF_SIZE)
+            .min(data.len() - hdr);
+        // Warn only on a genuine over-cap capture. The `len > MAX_BUF_SIZE` guard is
+        // defense-in-depth: every EVENT_SOURCE_SSL producer shares this header and
+        // bpf_ringbuf_reserve does not zero the reservation, so a producer that omits
+        // `truncated` cannot trip a false warning on stale ring bytes.
+        if i32_at(mem::offset_of!(R, truncated)) != 0 && len > MAX_BUF_SIZE {
+            log::warn!(
+                "SSL payload exceeded {}-byte capture cap; captured {} of {} bytes (pid={})",
+                MAX_BUF_SIZE,
+                buf_size,
+                len,
+                u32_at(mem::offset_of!(R, pid)),
+            );
+        }
+        let buf = data[hdr..hdr + buf_size].to_vec();
+
+        let comm_off = mem::offset_of!(R, comm);
+        let mut comm_arr = [0u8; 16];
+        comm_arr.copy_from_slice(&data[comm_off..comm_off + 16]);
+
+        Some(Self {
+            source: u32_at(mem::offset_of!(R, source)),
+            timestamp_ns: config::ktime_to_unix_ns(u64_at(mem::offset_of!(R, timestamp_ns))),
+            delta_ns: u64_at(mem::offset_of!(R, delta_ns)),
+            pid: u32_at(mem::offset_of!(R, pid)),
+            tid: u32_at(mem::offset_of!(R, tid)),
+            uid: u32_at(mem::offset_of!(R, uid)),
+            len: len as u32,
+            rw: i32_at(mem::offset_of!(R, rw)),
+            comm: Self::parse_comm(&comm_arr),
+            buf,
+            is_handshake: i32_at(mem::offset_of!(R, is_handshake)) != 0,
+            ssl_ptr: u64_at(mem::offset_of!(R, ssl_ptr)),
+        })
     }
 
     /// Parse comm from the BPF struct field (layout matches C `char comm[16]`; generated
@@ -93,11 +149,7 @@ impl SslEvent {
     fn parse_comm<T>(comm: &[T; 16]) -> String {
         debug_assert_eq!(mem::size_of::<T>(), 1);
         let bytes = unsafe { slice::from_raw_parts(comm.as_ptr() as *const u8, 16) };
-        let bytes: Vec<u8> = bytes
-            .iter()
-            .copied()
-            .take_while(|&b| b != 0)
-            .collect();
+        let bytes: Vec<u8> = bytes.iter().copied().take_while(|&b| b != 0).collect();
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
@@ -113,7 +165,9 @@ impl SslEvent {
     }
 
     pub fn is_http_request(&self) -> bool {
-        const METHODS: &[&[u8]] = &[b"GET ", b"POST", b"PUT ", b"DELE", b"HEAD", b"OPTI", b"PATC"];
+        const METHODS: &[&[u8]] = &[
+            b"GET ", b"POST", b"PUT ", b"DELE", b"HEAD", b"OPTI", b"PATC",
+        ];
         METHODS.iter().any(|m| self.buf.starts_with(m))
     }
 
@@ -132,9 +186,8 @@ impl SslEvent {
             return false;
         }
         // Parse 3-byte frame length
-        let length = ((self.buf[0] as usize) << 16)
-            | ((self.buf[1] as usize) << 8)
-            | (self.buf[2] as usize);
+        let length =
+            ((self.buf[0] as usize) << 16) | ((self.buf[1] as usize) << 8) | (self.buf[2] as usize);
         // Frame type must be a known type (0..=9)
         let frame_type = self.buf[3];
         if frame_type > 9 {
@@ -191,18 +244,22 @@ pub struct SslSniff {
     rx: crossbeam_channel::Receiver<SslEvent>,
 }
 
+/// Maps sslsniff reuses from the shared bundle: ring buffer + process filter.
+const SHARED_MAPS: &[MapKind] = &[MapKind::Rb, MapKind::TracedProcesses];
+
 impl SslSniff {
-    /// Create a new SslSniff with its own traced_processes map
+    /// Create a new SslSniff with its own (unshared) maps.
     pub fn new() -> Result<Self> {
-        Self::new_with_traced_processes(None, None)
+        Self::build(None)
     }
 
-    /// Create a new SslSniff with an optional external traced_processes map and shared ring buffer
-    /// 
-    /// # Arguments
-    /// * `traced_processes` - Optional external MapHandle for traced_processes (for map reuse)
-    /// * `rb` - Optional external MapHandle for shared ring buffer (for map reuse)
-    pub fn new_with_traced_processes(traced_processes: Option<&MapHandle>, rb: Option<&MapHandle>) -> Result<Self> {
+    /// Create a new SslSniff that reuses the shared ring buffer and process filter.
+    pub fn new_with_shared(shared: &SharedMaps) -> Result<Self> {
+        Self::build(Some(shared))
+    }
+
+    /// Open + load the skeleton (optionally reusing shared maps) and build `Self`.
+    fn build(shared: Option<&SharedMaps>) -> Result<Self> {
         // ── Open + load skeleton ───────────────────────────────────────
         let mut builder = SslsniffSkelBuilder::default();
         builder.obj_builder.debug(config::verbose());
@@ -210,22 +267,11 @@ impl SslSniff {
         let open_object = Box::new(MaybeUninit::<libbpf_rs::OpenObject>::uninit());
         let mut open_skel = builder.open().context("failed to open BPF object")?;
 
-        // If external traced_processes map is provided, reuse its fd
-        if let Some(map) = traced_processes {
-            open_skel
-                .maps_mut()
-                .traced_processes()
-                .reuse_fd(map.as_fd())
-                .context("failed to reuse external traced_processes map")?;
-        }
-
-        // If external rb map is provided, reuse its fd
-        if let Some(map) = rb {
-            open_skel
-                .maps_mut()
-                .rb()
-                .reuse_fd(map.as_fd())
-                .context("failed to reuse external rb map")?;
+        // Reuse shared maps when running under the unified manager.
+        if let Some(shared) = shared {
+            shared
+                .reuse_into(SHARED_MAPS, open_skel.open_object_mut())
+                .context("failed to reuse shared maps for sslsniff")?;
         }
 
         let skel = open_skel.load().context("failed to load BPF object")?;
@@ -261,9 +307,12 @@ impl SslSniff {
         }
 
         // Debug: print all libs found
-        log::debug!("[attach_process] pid={pid}: found {} libs: {:?}", 
-            libs.len(), 
-            libs.iter().map(|(p, i, k)| (p.as_str(), *i, format!("{:?}", k))).collect::<Vec<_>>()
+        log::debug!(
+            "[attach_process] pid={pid}: found {} libs: {:?}",
+            libs.len(),
+            libs.iter()
+                .map(|(p, i, k)| (p.as_str(), *i, format!("{k:?}")))
+                .collect::<Vec<_>>()
         );
 
         let mut attached_inodes = Vec::new();
@@ -282,31 +331,25 @@ impl SslSniff {
                 SslLibKind::OpenSsl => attach_openssl(&mut self.skel, &path, -1),
                 SslLibKind::GnuTls => attach_gnutls(&mut self.skel, &path, -1),
                 SslLibKind::Nss => attach_nss(&mut self.skel, &path, -1),
-                SslLibKind::Boring => {
-                    match attach_boringssl_by_symbol(&mut self.skel, &path, -1) {
-                        Ok(ls) => Ok(ls),
-                        Err(sym_err) => {
-                            log::debug!(
-                                "[attach_process] pid={pid}: BoringSSL symbol attach failed for {path} ({sym_err:#}), falling back to byte-pattern"
-                            );
-                            match find_boringssl_offsets(&path) {
-                                Some(off) => attach_boringssl_by_offset(
-                                    &mut self.skel,
-                                    &path,
-                                    &off,
-                                    false,
-                                    -1,
-                                ),
-                                None => {
-                                    log::warn!(
-                                        "[attach_process] pid={pid}: BoringSSL detection failed for {path} (no SSL_* in .dynsym and no byte-pattern match), skipping"
-                                    );
-                                    continue;
-                                }
+                SslLibKind::Boring => match attach_boringssl_by_symbol(&mut self.skel, &path, -1) {
+                    Ok(ls) => Ok(ls),
+                    Err(sym_err) => {
+                        log::debug!(
+                            "[attach_process] pid={pid}: BoringSSL symbol attach failed for {path} ({sym_err:#}), falling back to byte-pattern"
+                        );
+                        match find_boringssl_offsets(&path) {
+                            Some(off) => {
+                                attach_boringssl_by_offset(&mut self.skel, &path, &off, false, -1)
+                            }
+                            None => {
+                                log::warn!(
+                                    "[attach_process] pid={pid}: BoringSSL detection failed for {path} (no SSL_* in .dynsym and no byte-pattern match), skipping"
+                                );
+                                continue;
                             }
                         }
                     }
-                }
+                },
             };
 
             match result {
@@ -339,7 +382,10 @@ impl SslSniff {
             for inode in &inodes {
                 self.traced_files.remove(inode);
             }
-            log::debug!("[detach_process] pid={pid}: removed {} inodes from traced_files", inodes.len());
+            log::debug!(
+                "[detach_process] pid={pid}: removed {} inodes from traced_files",
+                inodes.len()
+            );
         }
     }
 
@@ -349,7 +395,6 @@ impl SslSniff {
     /// Returns a [`SslPoller`] handle.  Drop it (or call [`SslPoller::stop`])
     /// to signal the poll thread to exit.
     pub fn run(&self) -> Result<SslPoller> {
-        let min_sz = std::mem::size_of::<RawEvent>();
         let tx = self.tx.clone();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_inner = Arc::clone(&stop_flag);
@@ -360,15 +405,12 @@ impl SslSniff {
         let mut rb_builder = RingBufferBuilder::new();
         let binding = self.skel.maps();
         rb_builder
-            .add(&binding.rb(), move |data: &[u8]| {
-                if data.len() < min_sz {
-                    return 0;
+            .add(binding.rb(), move |data: &[u8]| {
+                // SSL records are variable-length (tiered reservation): decode by
+                // header prefix + buf_size, not a full-struct cast.
+                if let Some(event) = SslEvent::from_bytes(data) {
+                    let _ = tx.send(event);
                 }
-                // SAFETY: eBPF side guarantees the layout and alignment.
-                // Read raw BPF event and convert to user-space SslEvent (copies only actual data)
-                let raw = unsafe { &*(data.as_ptr() as *const RawEvent) };
-                let event = SslEvent::from_bpf(raw);
-                let _ = tx.send(event);
                 0
             })
             .context("failed to add ring buffer")?;
@@ -442,10 +484,6 @@ impl Drop for SslPoller {
         }
     }
 }
-
-// ─── Raw kernel event layout (matches sslsniff.h) ────────────────────────────
-
-type RawEvent = bpf::probe_SSL_data_t;
 
 // ─── BoringSSL pattern detection ─────────────────────────────────────────────
 
@@ -535,7 +573,7 @@ fn find_boringssl_offsets(path: &str) -> Option<BoringSslOffsets> {
         hs_matches[0]
     } else {
         // Multiple matches: choose the one closest before read_off.
-        match hs_matches.iter().filter(|&&o| o < read_off).last() {
+        match hs_matches.iter().filter(|&&o| o < read_off).next_back() {
             Some(&o) => o,
             None => {
                 if verbose {
@@ -675,7 +713,7 @@ fn ssl_libs_from_maps(pid: i32) -> Result<Vec<(String, u64, SslLibKind)>> {
             let path_str = if path_str.ends_with(" (deleted)") {
                 format!("/proc/{pid}/exe")
             } else {
-                format!("/proc/{pid}/root{}", path_str)
+                format!("/proc/{pid}/root{path_str}")
             };
             results.push((path_str, inode, kind));
         }
@@ -684,18 +722,9 @@ fn ssl_libs_from_maps(pid: i32) -> Result<Vec<(String, u64, SslLibKind)>> {
     Ok(results)
 }
 
-/// Convert a null-terminated byte array (from C `char comm[TASK_COMM_LEN]`) to a `String`.
-fn comm_to_string(comm: &[u8]) -> String {
-    let bytes: Vec<u8> = comm
-        .iter()
-        .copied()
-        .take_while(|&b| b != 0)
-        .collect();
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
 // ─── uprobe helpers ───────────────────────────────────────────────────────────
 
+#[allow(clippy::field_reassign_with_default)]
 fn make_sym_opts(sym: &str, retprobe: bool) -> UprobeOpts {
     let mut o = UprobeOpts::default();
     o.func_name = sym.to_string();
@@ -907,4 +936,157 @@ fn attach_boringssl_by_offset(
         )?);
     }
     Ok(links)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a raw ring-buffer sample: the header prefix (each field written at its
+    /// real bindgen offset) followed by `payload`, with buf_size/len/truncated/
+    /// is_handshake set explicitly. Each scalar header field gets a DISTINCT
+    /// sentinel (pid≠tid≠uid, a marker delta_ns/comm) so any field/offset swap among
+    /// the adjacent u32s or on rw/comm/is_handshake fails a test. `tail_pad` appends
+    /// bytes AFTER the payload to simulate a still-full-size record (e.g. tcpsniff's
+    /// 4 MiB reservation) whose data.len() exceeds buf_size.
+    fn make_record(
+        payload: &[u8],
+        buf_size: u32,
+        len: u32,
+        truncated: i32,
+        tail_pad: usize,
+        is_handshake: i32,
+    ) -> Vec<u8> {
+        type R = bpf::probe_SSL_data_t;
+        let hdr = std::mem::offset_of!(R, buf);
+        let mut v = vec![0u8; hdr + payload.len() + tail_pad];
+        let put_u32 = |v: &mut [u8], off: usize, val: u32| {
+            v[off..off + 4].copy_from_slice(&val.to_ne_bytes())
+        };
+        let put_u64 = |v: &mut [u8], off: usize, val: u64| {
+            v[off..off + 8].copy_from_slice(&val.to_ne_bytes())
+        };
+        let put_i32 = |v: &mut [u8], off: usize, val: i32| {
+            v[off..off + 4].copy_from_slice(&val.to_ne_bytes())
+        };
+        put_u32(&mut v, std::mem::offset_of!(R, source), 2); // EVENT_SOURCE_SSL
+        put_u64(&mut v, std::mem::offset_of!(R, timestamp_ns), 0);
+        put_u64(&mut v, std::mem::offset_of!(R, delta_ns), 0xDEAD_BEEF);
+        put_u32(&mut v, std::mem::offset_of!(R, pid), 1234);
+        put_u32(&mut v, std::mem::offset_of!(R, tid), 5678);
+        put_u32(&mut v, std::mem::offset_of!(R, uid), 4321);
+        put_u32(&mut v, std::mem::offset_of!(R, len), len);
+        put_u32(&mut v, std::mem::offset_of!(R, buf_size), buf_size);
+        put_i32(&mut v, std::mem::offset_of!(R, rw), 1);
+        put_i32(&mut v, std::mem::offset_of!(R, is_handshake), is_handshake);
+        put_i32(&mut v, std::mem::offset_of!(R, truncated), truncated);
+        put_u64(&mut v, std::mem::offset_of!(R, ssl_ptr), 0xABCD);
+        let comm_off = std::mem::offset_of!(R, comm);
+        v[comm_off..comm_off + 4].copy_from_slice(b"node");
+        v[hdr..hdr + payload.len()].copy_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn from_bytes_decodes_small_record() {
+        // A small (16 KiB-tier) record — the whole point of the fix. Under the old
+        // `data.len() >= size_of::<full struct>()` (~4 MiB) gate this sample was
+        // DROPPED, so reverting to that gate makes this test fail.
+        let payload = b"POST /v1/messages HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+        let rec = make_record(payload, payload.len() as u32, payload.len() as u32, 0, 0, 0);
+        assert!(
+            rec.len() < MAX_BUF_SIZE,
+            "record is far smaller than the full struct"
+        );
+        let ev = SslEvent::from_bytes(&rec).expect("small record must decode");
+        assert_eq!(&ev.buf[..], &payload[..]);
+        assert_eq!(ev.len as usize, payload.len());
+        assert_eq!(ev.ssl_ptr, 0xABCD);
+        // Each header scalar decodes from its OWN offset (distinct sentinels: a
+        // pid/tid offset swap, or an unset uid/delta_ns/rw/comm, fails here).
+        assert_eq!(ev.pid, 1234);
+        assert_eq!(ev.tid, 5678, "tid decodes from its own offset, not pid's");
+        assert_eq!(ev.uid, 4321);
+        assert_eq!(ev.delta_ns, 0xDEAD_BEEF);
+        assert_eq!(ev.rw, 1);
+        assert_eq!(ev.comm, "node");
+        assert!(!ev.is_handshake);
+    }
+
+    #[test]
+    fn from_bytes_decodes_handshake_header_only() {
+        // A handshake record carries NO payload: the BPF reserves header-only, so
+        // data.len() == offset_of!(buf) EXACTLY. The decoder must ACCEPT this
+        // boundary (a `<`→`<=` off-by-one at the header-length check would reject it)
+        // and decode is_handshake. Complements the reject-at-hdr-1 test below, so the
+        // header boundary is pinned on both sides.
+        let rec = make_record(&[], 0, 0, 0, 0, 1);
+        assert_eq!(
+            rec.len(),
+            std::mem::offset_of!(bpf::probe_SSL_data_t, buf),
+            "handshake record is exactly the header prefix"
+        );
+        let ev = SslEvent::from_bytes(&rec).expect("header-only handshake must decode");
+        assert!(ev.is_handshake, "is_handshake decodes true");
+        assert!(ev.buf.is_empty(), "no payload");
+    }
+
+    #[test]
+    fn from_bytes_uses_buf_size_field_not_data_len() {
+        // A still-full-size record (e.g. tcpsniff's 4 MiB reservation): data carries
+        // many bytes after the payload, but buf_size says only `n` are real. The
+        // decoder MUST take buf_size bytes, never data.len()-hdr — otherwise it would
+        // read the padding tail. Reverting to a data.len()-derived length fails this.
+        let payload = b"hi there";
+        let rec = make_record(
+            payload,
+            payload.len() as u32,
+            payload.len() as u32,
+            0,
+            4096,
+            0,
+        );
+        let ev = SslEvent::from_bytes(&rec).expect("full-size record must decode");
+        assert_eq!(
+            &ev.buf[..],
+            &payload[..],
+            "buf is the buf_size bytes, not the padded tail"
+        );
+    }
+
+    #[test]
+    fn from_bytes_rejects_short_header() {
+        // A sample shorter than the header prefix is rejected (no UB, no full cast).
+        let hdr = std::mem::offset_of!(bpf::probe_SSL_data_t, buf);
+        assert!(SslEvent::from_bytes(&vec![0u8; hdr - 1]).is_none());
+    }
+
+    #[test]
+    fn from_bytes_decodes_truncated_record() {
+        // A truncated record (payload clamped to the cap): buf_size < len, truncated=1,
+        // len > MAX_BUF_SIZE. The decoder still returns the captured bytes; len reports
+        // the true size. Also exercises the warn guard's positive case.
+        let captured = vec![b'x'; 64];
+        let rec = make_record(&captured, captured.len() as u32, 9_000_000, 1, 0, 0);
+        let ev = SslEvent::from_bytes(&rec).expect("truncated record must still decode");
+        assert_eq!(ev.buf.len(), 64);
+        assert_eq!(
+            ev.len, 9_000_000,
+            "len reports the true (pre-truncation) size"
+        );
+    }
+
+    #[test]
+    fn from_bytes_clamps_oversized_buf_size_to_available() {
+        // Defense: a buf_size larger than the bytes present must not read past the
+        // sample (clamped to data.len()-hdr).
+        let payload = b"abc";
+        let rec = make_record(payload, 1000, 1000, 0, 0, 0);
+        let ev = SslEvent::from_bytes(&rec).expect("decode");
+        assert_eq!(
+            ev.buf.len(),
+            payload.len(),
+            "buf_size clamped to available bytes"
+        );
+    }
 }

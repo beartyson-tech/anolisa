@@ -22,17 +22,23 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from hook_utils import resolve_binary, skip, warn, try_parse_json, unwrap_string_json, is_skill_file, _TOKENLESS_FALLBACK, _TOKENLESS_LOCAL_SHARE, _TOKENLESS_LOCAL_LIB
+from hook_utils import (
+    _TOKENLESS_FALLBACK,
+    _TOKENLESS_LOCAL_LIB,
+    _TOKENLESS_LOCAL_SHARE,
+    CONTENT_RETRIEVAL_TOOLS,
+    is_skill_file,
+    resolve_binary,
+    skip,
+    try_parse_json,
+    unwrap_string_json,
+    warn,
+)
 
 # -- constants ---------------------------------------------------------------
 
 _AGENT_ID = os.environ.get("TOKENLESS_AGENT_ID", "tokenless")
 _MIN_RESPONSE_CHARS = 200
-
-_SKIP_TOOLS = {
-    "Read", "read_file", "Glob", "list_directory",
-    "NotebookRead", "read", "glob", "notebookread",
-}
 
 
 # -- main --------------------------------------------------------------------
@@ -40,7 +46,12 @@ _SKIP_TOOLS = {
 
 def main() -> None:
     # 1. Resolve binaries
-    tokenless_bin = resolve_binary("tokenless", _TOKENLESS_FALLBACK, _TOKENLESS_LOCAL_SHARE, _TOKENLESS_LOCAL_LIB)
+    tokenless_bin = resolve_binary(
+        "tokenless",
+        _TOKENLESS_FALLBACK,
+        _TOKENLESS_LOCAL_SHARE,
+        _TOKENLESS_LOCAL_LIB,
+    )
     if not tokenless_bin:
         warn("tokenless is not installed. TOON compression hook disabled.")
         skip()
@@ -52,9 +63,9 @@ def main() -> None:
         warn("failed to read PostToolUse payload. Passing through unchanged.")
         skip()
 
-    # 3. Skip content-retrieval tools
+    # 3. Skip content-retrieval tools (preserve integrity)
     tool_name = input_data.get("tool_name", "unknown")
-    if tool_name in _SKIP_TOOLS:
+    if tool_name in CONTENT_RETRIEVAL_TOOLS:
         skip()
 
     # 4. Extract tool_response
@@ -90,7 +101,9 @@ def main() -> None:
 
     # 9. Extract caller context
     session_id = input_data.get("session_id", "")
-    tool_use_id = input_data.get("tool_use_id") or input_data.get("toolCallId", "")
+    tool_use_id = input_data.get("tool_use_id") or input_data.get(
+        "toolCallId", ""
+    )
 
     # 10. Encode to TOON via tokenless compress-toon
     cmd = [tokenless_bin, "compress-toon", "--agent-id", _AGENT_ID]
@@ -103,10 +116,21 @@ def main() -> None:
         proc = subprocess.run(
             cmd,
             input=tool_response,
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
-    except Exception:
-        warn("TOON encoding failed. Passing through unchanged.")
+    except Exception as e:
+        warn(f"TOON encoding failed: {e}. Passing through unchanged.")
+        skip()
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip()[:200]
+        warn(
+            f"TOON encoding exited with code {proc.returncode}: {detail}"
+            if detail
+            else f"TOON encoding exited with code {proc.returncode}. Passing through unchanged."
+        )
         skip()
 
     toon_output = proc.stdout.strip()

@@ -205,17 +205,26 @@ impl MemoryMcpServer {
     // ---- Tier B: structured search/write API for weak models or batch use ----
 
     #[tool(
-        description = "Tier B: structured BM25 search across the indexed memory store. Returns ranked snippets as JSON. Prefer mem_grep for one-off regex needs; this is faster on large stores."
+        description = "Tier B: search the indexed memory store. Default BM25 keyword search. Set mode=vector for semantic (embedding) search, or mode=hybrid for combined ranking. Requires [memory.embedding] config for vector/hybrid."
     )]
     async fn memory_search(
         &self,
         #[tool(param)] query: String,
         #[tool(param)] top_k: Option<u32>,
+        #[tool(param)] mode: Option<String>,
     ) -> ToolResult {
+        // Reject excessively long queries to prevent FTS5 resource exhaustion.
+        const MAX_QUERY_LEN: usize = 1024;
+        if query.len() > MAX_QUERY_LEN {
+            return Err(format!(
+                "query too long ({} chars, max {MAX_QUERY_LEN})",
+                query.len()
+            ));
+        }
         let k = top_k.unwrap_or(5) as usize;
         let hits = self
             .svc
-            .memory_search(&query, k)
+            .memory_search(&query, k, mode.as_deref())
             .map_err(|e| fmt_err("search failed", e))?;
         serde_json::to_string_pretty(&hits).map_err(|e| fmt_err("search serialize failed", e))
     }
@@ -306,6 +315,16 @@ impl MemoryMcpServer {
             .map(|hash| format!("reverted {path} (commit {hash})"))
             .map_err(|e| fmt_err("mem_revert failed", e))
     }
+
+    // ---- Consolidation (auto + manual trigger) ----
+
+    #[tool(
+        description = "Manually trigger memory consolidation: analyse the current session's audit log and extract atomic facts (L1 memories). Auto-consolidation also runs on shutdown. Returns the number of facts extracted."
+    )]
+    async fn mem_consolidate(&self) -> ToolResult {
+        let n = self.svc.consolidate();
+        Ok(format!("consolidation complete: {n} facts written"))
+    }
 }
 
 rmcp::tool_box!(MemoryMcpServer {
@@ -328,6 +347,7 @@ rmcp::tool_box!(MemoryMcpServer {
     mem_snapshot_restore,
     mem_log,
     mem_revert,
+    mem_consolidate,
 } memory_tool_box);
 
 impl ServerHandler for MemoryMcpServer {

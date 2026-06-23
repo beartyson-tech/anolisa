@@ -5,12 +5,16 @@ Reads a PostToolUse JSON from stdin, compresses the tool response
 via ``tokenless compress-response``, then optionally re-encodes to TOON
 format via ``tokenless compress-toon`` for additional token savings.
 
-Pipeline: Env Attribution → Response Compression → TOON Encoding
+Pipeline: Env Attribution → Layered分流 → Compression → TOON Encoding
   1. If tool_response contains errors, classify as environment vs logic issue
      and inject "Skip retry" guidance for LLM
-  2. Strip debug fields, nulls, empty values; truncate long strings/arrays
-  3. If the compressed result is still valid JSON, encode to TOON format
-  4. Stats are recorded automatically by tokenless compress-response.
+  2. 3-layer tool dispatch:
+     - Content retrieval (Read/Glob/Grep) → skip all compression
+     - Shell/exec (Bash/Shell) → moderate truncation (64K strings)
+     - Other tools → zero-truncation compress-response + TOON
+  3. Strip debug fields, nulls, empty values (no truncation risk)
+  4. If the compressed result is still valid JSON, encode to TOON format
+  5. Stats are recorded automatically by tokenless CLI commands.
 
 Hook point: **PostToolUse**
 
@@ -21,103 +25,33 @@ FHS spec: /usr/bin/tokenless.
 
 import json
 import os
-import re
 import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from hook_utils import resolve_binary, skip, warn, try_parse_json, unwrap_string_json, is_skill_file, _TOKENLESS_FALLBACK, _TOKENLESS_LOCAL_SHARE, _TOKENLESS_LOCAL_LIB
+from hook_utils import (
+    _TOKENLESS_FALLBACK,
+    _TOKENLESS_LOCAL_LIB,
+    _TOKENLESS_LOCAL_SHARE,
+    SKIP_TOOLS,
+    classify_env_error,
+    get_thresholds,
+    is_skill_file,
+    resolve_binary,
+    skip,
+    try_parse_json,
+    unwrap_string_json,
+    warn,
+)
 
 # -- constants ---------------------------------------------------------------
 
 _AGENT_ID = os.environ.get("TOKENLESS_AGENT_ID", "tokenless")
 _MIN_RESPONSE_CHARS = 200
 
-_SKIP_TOOLS = {
-    "Read", "read_file", "Glob", "list_directory",
-    "NotebookRead", "read", "glob", "notebookread",
-}
 
-
-# -- env attribution patterns -------------------------------------------------
-
-_ENV_PATTERNS: list[tuple[list[str], str, str]] = [
-    # (patterns, category, fix_hint_template)
-    (
-        ["command not found", "not installed", "which: no", "No command '"],
-        "ENV_DEPENDENCY_MISSING",
-        "Install missing dependency: {missing}",
-    ),
-    (
-        ["Permission denied", "permission denied", "Access denied"],
-        "ENV_PERMISSION",
-        "Check file/dir permissions or run with appropriate access",
-    ),
-    (
-        ["No such file or directory", "cannot find", "does not exist", "ENOENT"],
-        "ENV_FILE_MISSING",
-        "Create or locate the required file/directory",
-    ),
-    (
-        [
-            "Connection refused", "ECONNREFUSED",
-            "Connection timed out", "ETIMEDOUT",
-            "curl: (7)", "curl: (6)", "network is unreachable",
-        ],
-        "ENV_NETWORK",
-        "Check network connectivity and DNS resolution",
-    ),
-    (
-        ["ModuleNotFoundError", "cannot find module", "ImportError", "npm ERR! 404"],
-        "ENV_PACKAGE_MISSING",
-        "Install the required module/package",
-    ),
-]
-
-
-def _extract_missing_cmd(error_text: str) -> str:
-    """Extract the missing command name from shell error messages."""
-    # bash: "bash: line 1: foo: command not found" or "foo: command not found"
-    m = re.search(r": (\S+): command not found", error_text)
-    if m:
-        return m.group(1)
-    # zsh: "command not found: foo"
-    m = re.search(r"command not found: (\S+)", error_text)
-    if m:
-        return m.group(1)
-    m = re.search(r"which: no (\S+)", error_text)
-    if m:
-        return m.group(1)
-    return "unknown"
-
-
-def _classify_env_error(parsed: dict) -> tuple[str | None, str | None]:
-    """Classify tool execution failures as environment issues vs logic errors.
-
-    Returns (category, fix_hint) if an environment error is detected, or
-    (None, None) otherwise.
-    """
-    if not isinstance(parsed, dict):
-        return None, None
-
-    exit_code = parsed.get("exit_code")
-    stderr_text = str(parsed.get("stderr", ""))
-    error_field = str(parsed.get("error", ""))
-    error_text = stderr_text + error_field
-
-    has_error = bool(error_text) or exit_code in (1, 2)
-    if not has_error:
-        return None, None
-
-    for patterns, category, fix_hint in _ENV_PATTERNS:
-        for pat in patterns:
-            if pat in error_text:
-                if category == "ENV_DEPENDENCY_MISSING":
-                    fix_hint = fix_hint.replace("{missing}", _extract_missing_cmd(error_text))
-                return category, fix_hint
-
-    return None, None
+# -- helpers -------------------------------------------------------------------
 
 
 def _build_additional_context(
@@ -134,9 +68,21 @@ def _build_additional_context(
 # -- main --------------------------------------------------------------------
 
 
+def _warn_subprocess(label: str, proc: subprocess.CompletedProcess) -> None:
+    """Log a non-zero subprocess exit with truncated stderr."""
+    detail = (proc.stderr or "").strip()[:200]
+    warn(
+        f"{label} exited {proc.returncode}: {detail}"
+        if detail
+        else f"{label} exited {proc.returncode} with empty stderr"
+    )
+
+
 def main() -> None:
     # 1. Resolve binaries
-    tokenless_bin = resolve_binary("tokenless", _TOKENLESS_FALLBACK, _TOKENLESS_LOCAL_SHARE, _TOKENLESS_LOCAL_LIB)
+    tokenless_bin = resolve_binary(
+        "tokenless", _TOKENLESS_FALLBACK, _TOKENLESS_LOCAL_SHARE, _TOKENLESS_LOCAL_LIB
+    )
     if not tokenless_bin:
         warn("tokenless is not installed. Response compression hook disabled.")
         skip()
@@ -148,10 +94,8 @@ def main() -> None:
         warn("failed to read PostToolUse payload. Passing through unchanged.")
         skip()
 
-    # 3. Skip content-retrieval tools
+    # 3. Extract tool_name (skip-tools分流 handled after attribution)
     tool_name = input_data.get("tool_name", "unknown")
-    if tool_name in _SKIP_TOOLS:
-        skip()
 
     # 4. Extract tool_response
     tool_response_raw = input_data.get("tool_response", "")
@@ -173,34 +117,70 @@ def main() -> None:
     else:
         skip()
 
-    # 7. Skip small responses (character count, not byte length)
-    if len(tool_response) < _MIN_RESPONSE_CHARS:
-        skip()
-
-    # 8. Validate it's JSON
+    # 7. Validate it's JSON (needed for attribution on skip-tools too)
     parsed = try_parse_json(tool_response)
     if parsed is None:
         skip()
 
-    # 9. Extract caller context
+    # 8. Extract caller context
     session_id = input_data.get("session_id", "")
     tool_use_id = input_data.get("tool_use_id") or input_data.get("toolCallId", "")
 
-    # 9b. Environment attribution analysis
+    # 9. Environment attribution analysis
     env_attribution = ""
-    attr_category, attr_fix_hint = _classify_env_error(parsed if isinstance(parsed, dict) else {})
+    attr_category, attr_fix_hint = classify_env_error(parsed)
     if attr_category:
         env_attribution = (
             f"[tokenless:env] {tool_name} failed: "
             f"{attr_category} ({attr_fix_hint}). Skip retry."
         )
 
-    # 10. Step 1: Response compression (only on JSON objects/arrays)
+    # 10. Content retrieval — skip entirely (preserve integrity)
+    if tool_name in SKIP_TOOLS:
+        if env_attribution:
+            output = {
+                "suppressOutput": True,
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": env_attribution,
+                },
+            }
+            print(json.dumps(output, ensure_ascii=False))
+            return
+        skip()
+
+    # 11. All other tools — skip small responses, but still inject
+    # env attribution for error cases (small size doesn't mean the
+    # error classification is unimportant to the agent).
+    if len(tool_response) < _MIN_RESPONSE_CHARS:
+        if env_attribution:
+            output = {
+                "suppressOutput": True,
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": env_attribution,
+                },
+            }
+            print(json.dumps(output, ensure_ascii=False))
+            return
+        skip()
+
+    # 12. Step 1: Response compression with 3-layer thresholds
+    #   Layer 1 (content retrieval): already skipped above
+    #   Layer 2 (shell/exec): moderate truncation (64K/128/8) — plain text output
+    #   Layer 3 (API/structured): zero-truncation (1M/64K/32) — preserve content
     compressed = tool_response
     used_resp_compression = False
 
     if isinstance(parsed, (dict, list)):
-        cmd = [tokenless_bin, "compress-response", "--agent-id", _AGENT_ID]
+        thresholds = get_thresholds(tool_name)
+        cmd = [
+            tokenless_bin, "compress-response",
+            "--agent-id", _AGENT_ID,
+            "--truncate-strings-at", str(thresholds[0]),
+            "--truncate-arrays-at", str(thresholds[1]),
+            "--max-depth", str(thresholds[2]),
+        ]
         if session_id:
             cmd.extend(["--session-id", session_id])
         if tool_use_id:
@@ -210,15 +190,19 @@ def main() -> None:
             proc = subprocess.run(
                 cmd,
                 input=tool_response,
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, timeout=3,
             )
             if proc.returncode == 0 and proc.stdout.strip():
-                compressed = proc.stdout.strip()
-                used_resp_compression = True
-        except Exception:
-            pass  # Fall through to original
+                candidate = proc.stdout.strip()
+                if len(candidate) < len(tool_response):
+                    compressed = candidate
+                    used_resp_compression = True
+            elif proc.returncode != 0:
+                _warn_subprocess("compress-response", proc)
+        except Exception as e:
+            warn(f"Response compression error: {e}")
 
-    # 11. Step 2: TOON encoding (via tokenless compress-toon for stats)
+    # 13. Step 2: TOON encoding
     toon_output = ""
 
     if tokenless_bin:
@@ -233,19 +217,21 @@ def main() -> None:
                 proc = subprocess.run(
                     toon_cmd,
                     input=compressed,
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True, text=True, timeout=1,
                 )
                 if proc.returncode == 0 and proc.stdout.strip():
                     candidate = proc.stdout.strip()
                     if len(candidate) < len(compressed):
                         toon_output = candidate
-            except Exception:
-                pass
+                elif proc.returncode != 0:
+                    _warn_subprocess("compress-toon", proc)
+            except Exception as e:
+                warn(f"TOON encoding error: {e}")
 
     # Determine final output
     final_output = toon_output if toon_output else compressed
 
-    # 12. Build response
+    # 14. Build response
     context = _build_additional_context(
         final_output,
         env_attribution=env_attribution,

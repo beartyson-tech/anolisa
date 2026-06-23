@@ -46,6 +46,8 @@ pub struct MemoryConfig {
     #[serde(default)]
     pub index: IndexConfig,
     #[serde(default)]
+    pub embedding: crate::embedding::EmbeddingConfig,
+    #[serde(default)]
     pub mount: MountConfig,
     #[serde(default)]
     pub audit: AuditConfig,
@@ -53,6 +55,9 @@ pub struct MemoryConfig {
     pub cgroup: crate::cgroup::CgroupConfig,
     #[serde(default)]
     pub git: crate::git_repo::GitConfig,
+    /// Consolidation: auto-extract facts from session audit logs on shutdown.
+    #[serde(default)]
+    pub consolidation: ConsolidationConfig,
     /// Maximum bytes returned by a single mem_read call. Files exceeding
     /// this cap are rejected with InvalidArgument to prevent multi-GB
     /// blobs from exhausting memory. Default 1 MiB.
@@ -77,10 +82,12 @@ impl Default for MemoryConfig {
             paths: PathsConfig::default(),
             session: SessionConfig::default(),
             index: IndexConfig::default(),
+            embedding: crate::embedding::EmbeddingConfig::default(),
             mount: MountConfig::default(),
             audit: AuditConfig::default(),
             cgroup: crate::cgroup::CgroupConfig::default(),
             git: crate::git_repo::GitConfig::default(),
+            consolidation: ConsolidationConfig::default(),
             max_read_bytes: default_max_read_bytes(),
             max_write_bytes: default_max_write_bytes(),
             max_append_bytes: default_max_append_bytes(),
@@ -96,6 +103,45 @@ pub struct AuditConfig {
     /// other platforms or when journald is unreachable.
     #[serde(default)]
     pub journald: bool,
+}
+
+/// Configuration for automatic memory consolidation (L1 fact extraction).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsolidationConfig {
+    /// Enable auto-consolidation on session end. Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Maximum facts to extract per session. Prevents runaway extraction.
+    /// Default: 20.
+    #[serde(default = "default_max_facts")]
+    pub max_facts: usize,
+    /// Minimum tool calls in a session before consolidation triggers.
+    /// Short sessions (1-2 calls) aren't worth extracting. Default: 3.
+    #[serde(default = "default_min_calls")]
+    pub min_tool_calls: usize,
+}
+
+impl Default for ConsolidationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            max_facts: default_max_facts(),
+            min_tool_calls: default_min_calls(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_max_facts() -> usize {
+    20
+}
+
+fn default_min_calls() -> usize {
+    3
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -325,6 +371,36 @@ impl AppConfig {
             }
         }
         self.memory.audit.journald = env_bool("MEMORY_AUDIT_JOURNALD", self.memory.audit.journald);
+        // Embedding backend env overrides
+        if let Ok(backend) = std::env::var("MEMORY_EMBEDDING_BACKEND") {
+            match backend.to_lowercase().as_str() {
+                "none" => self.memory.embedding = crate::embedding::EmbeddingConfig::None,
+                "openai" => {
+                    let api_key = std::env::var("MEMORY_OPENAI_API_KEY")
+                        .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                        .unwrap_or_default();
+                    let model = std::env::var("MEMORY_OPENAI_MODEL")
+                        .unwrap_or_else(|_| "text-embedding-3-small".to_string());
+                    let base_url = std::env::var("MEMORY_OPENAI_BASE_URL").ok();
+                    self.memory.embedding = crate::embedding::EmbeddingConfig::OpenAI {
+                        api_key,
+                        model,
+                        base_url,
+                    };
+                }
+                "ollama" => {
+                    let model = std::env::var("MEMORY_OLLAMA_MODEL")
+                        .unwrap_or_else(|_| "nomic-embed-text".to_string());
+                    let base_url = std::env::var("MEMORY_OLLAMA_BASE_URL")
+                        .unwrap_or_else(|_| "http://localhost:11434".to_string());
+                    self.memory.embedding =
+                        crate::embedding::EmbeddingConfig::Ollama { model, base_url };
+                }
+                _ => {
+                    tracing::warn!("unknown MEMORY_EMBEDDING_BACKEND={backend:?}; keeping config");
+                }
+            }
+        }
         self.memory.cgroup.enabled = env_bool("MEMORY_CGROUP_ENABLED", self.memory.cgroup.enabled);
         if let Ok(v) = std::env::var("MEMORY_CGROUP_MEMORY_MAX") {
             self.memory.cgroup.memory_max = v;
@@ -332,6 +408,27 @@ impl AppConfig {
         self.memory.git.enabled = env_bool("MEMORY_GIT_ENABLED", self.memory.git.enabled);
         self.memory.git.auto_commit =
             env_bool("MEMORY_GIT_AUTO_COMMIT", self.memory.git.auto_commit);
+        // Consolidation env overrides
+        self.memory.consolidation.enabled = env_bool(
+            "MEMORY_CONSOLIDATION_ENABLED",
+            self.memory.consolidation.enabled,
+        );
+        if let Ok(v) = std::env::var("MEMORY_CONSOLIDATION_MAX_FACTS") {
+            match v.parse::<usize>() {
+                Ok(n) => self.memory.consolidation.max_facts = n,
+                Err(e) => tracing::warn!(
+                    "MEMORY_CONSOLIDATION_MAX_FACTS={v:?} not a usize: {e}; ignoring"
+                ),
+            }
+        }
+        if let Ok(v) = std::env::var("MEMORY_CONSOLIDATION_MIN_CALLS") {
+            match v.parse::<usize>() {
+                Ok(n) => self.memory.consolidation.min_tool_calls = n,
+                Err(e) => tracing::warn!(
+                    "MEMORY_CONSOLIDATION_MIN_CALLS={v:?} not a usize: {e}; ignoring"
+                ),
+            }
+        }
         if let Ok(v) = std::env::var("MEMORY_MAX_READ_BYTES") {
             match v.parse::<u64>() {
                 Ok(n) => self.memory.max_read_bytes = n,
@@ -362,5 +459,78 @@ impl AppConfig {
     pub fn resolved_session_dir(&self) -> PathBuf {
         let expanded = shellexpand::tilde(&self.memory.session.base_dir);
         PathBuf::from(expanded.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embedding::EmbeddingConfig;
+
+    #[test]
+    fn embedding_config_default_is_none() {
+        let cfg = AppConfig::default();
+        assert!(matches!(cfg.memory.embedding, EmbeddingConfig::None));
+    }
+
+    #[test]
+    fn embedding_config_parses_openai_from_toml() {
+        let toml = r#"
+            [memory.embedding]
+            backend = "openai"
+            api_key = "sk-test"
+            model = "text-embedding-3-large"
+            "#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        match &cfg.memory.embedding {
+            EmbeddingConfig::OpenAI {
+                api_key,
+                model,
+                base_url,
+            } => {
+                assert_eq!(api_key, "sk-test");
+                assert_eq!(model, "text-embedding-3-large");
+                assert!(base_url.is_none());
+            }
+            other => panic!("expected OpenAI, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn embedding_config_parses_ollama_from_toml() {
+        let toml = r#"
+            [memory.embedding]
+            backend = "ollama"
+            model = "bge-m3"
+            base_url = "http://gpu-box:11434"
+            "#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        match &cfg.memory.embedding {
+            EmbeddingConfig::Ollama { model, base_url } => {
+                assert_eq!(model, "bge-m3");
+                assert_eq!(base_url, "http://gpu-box:11434");
+            }
+            other => panic!("expected Ollama, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn embedding_config_env_override_defaults_to_none() {
+        // When MEMORY_EMBEDDING_BACKEND is not set, config stays at default (None).
+        let mut cfg = AppConfig::default();
+        cfg.apply_env_overrides();
+        assert!(matches!(cfg.memory.embedding, EmbeddingConfig::None));
+    }
+
+    #[test]
+    fn shipped_default_toml_parses() {
+        // Regression guard: every field present in config/default.toml must
+        // exist on the corresponding struct (which all use
+        // `deny_unknown_fields`). A typo or stale field here would fail
+        // parsing at runtime for anyone using the shipped config.
+        let toml_src = include_str!("../config/default.toml");
+        let cfg: AppConfig = toml::from_str(toml_src).expect("shipped default.toml must parse");
+        assert!(cfg.memory.consolidation.enabled);
+        assert!(cfg.memory.consolidation.max_facts > 0);
     }
 }

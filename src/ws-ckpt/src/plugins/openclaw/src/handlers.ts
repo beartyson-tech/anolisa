@@ -8,8 +8,10 @@
 import { CommandExecutor } from "./commands.js";
 import { mapErrorToLLMMessage } from "./btrfs-manager.js";
 import type { AgentToolResult } from "../types-shim.js";
-import { pluginState, UNAVAILABLE_MSG, cwdInsideWorkspace, CWD_INSIDE_WORKSPACE_REASON } from "./state.js";
-import { daemonAutoCleanup } from "./config.js";
+import { pluginState, UNAVAILABLE_MSG, cwdInsideWorkspace, cwdInsideWorkspaceReason } from "./state.js";
+import { parseWorkspaceCleanupJson } from "./config.js";
+import { persistConfig } from "./persist.js";
+import { CrontabManager, parseSchedulesUpdate } from "./cron.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -47,8 +49,9 @@ export async function handleCheckpoint(
   // Explicit workspace bypasses the manager (and its workspace-bound cache),
   // mirroring the handleDelete pattern.
   if (explicitWs) {
-    if (cwdInsideWorkspace(explicitWs)) {
-      return { text: CWD_INSIDE_WORKSPACE_REASON, isError: true };
+    const cwdCheck = cwdInsideWorkspace(explicitWs);
+    if (cwdCheck.inside) {
+      return { text: cwdInsideWorkspaceReason(cwdCheck.cwd, explicitWs), isError: true };
     }
     try {
       const executor = new CommandExecutor();
@@ -67,8 +70,11 @@ export async function handleCheckpoint(
   }
 
   const ws = pluginState.resolvedConfig?.workspace;
-  if (ws && cwdInsideWorkspace(ws)) {
-    return { text: CWD_INSIDE_WORKSPACE_REASON, isError: true };
+  if (ws) {
+    const cwdCheck = cwdInsideWorkspace(ws);
+    if (cwdCheck.inside) {
+      return { text: cwdInsideWorkspaceReason(cwdCheck.cwd, ws), isError: true };
+    }
   }
 
   const result = await pluginState.manager.createCheckpoint({
@@ -84,43 +90,62 @@ export async function handleCheckpoint(
 export async function handleRollback(
   target?: string,
   workspace?: string,
+  numAncestors?: number,
 ): Promise<{ text: string; isError: boolean }> {
   if (!pluginState.manager || !pluginState.environmentReady) {
     return { text: UNAVAILABLE_MSG, isError: true };
   }
   const trimmed = target?.trim();
-  if (!trimmed) {
+
+  if (trimmed && numAncestors !== undefined) {
+    return { text: "'target' and 'numAncestors' are mutually exclusive", isError: true };
+  }
+  if (!trimmed && numAncestors === undefined) {
     return {
-      text: "Usage: ws-ckpt-rollback <target>\n  target: snapshot hash id",
+      text: "Either 'target' or 'numAncestors' is required.\n  target: snapshot id\n  numAncestors: number of ancestors to traverse (>=1)",
       isError: true,
     };
   }
-
-  const explicitWs = workspace?.trim();
-  if (explicitWs) {
-    if (cwdInsideWorkspace(explicitWs)) {
-      return { text: CWD_INSIDE_WORKSPACE_REASON, isError: true };
-    }
-    try {
-      const executor = new CommandExecutor();
-      const output = await executor.rollback(explicitWs, trimmed);
-      if (output.exitCode !== 0) {
-        return { text: mapErrorToLLMMessage(output.stderr, { id: trimmed }), isError: true };
-      }
-      return { text: `Rolled back to ${trimmed}`, isError: false };
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      return { text: `Rollback error: ${msg}`, isError: true };
-    }
+  if (numAncestors !== undefined && (!Number.isFinite(numAncestors) || numAncestors < 1)) {
+    return { text: "'numAncestors' must be >= 1", isError: true };
   }
 
-  const ws = pluginState.resolvedConfig?.workspace;
-  if (ws && cwdInsideWorkspace(ws)) {
-    return { text: CWD_INSIDE_WORKSPACE_REASON, isError: true };
+  const resolvedWs = workspace?.trim() || pluginState.resolvedConfig?.workspace;
+  if (!resolvedWs) {
+    return { text: "No workspace configured", isError: true };
   }
 
-  const result = await pluginState.manager.rollback(trimmed);
+  const cwdCheck = cwdInsideWorkspace(resolvedWs);
+  if (cwdCheck.inside) {
+    return { text: cwdInsideWorkspaceReason(cwdCheck.cwd, resolvedWs), isError: true };
+  }
+
+  if (workspace?.trim()) {
+    return runRollbackViaExecutor(resolvedWs, trimmed || undefined, numAncestors);
+  }
+
+  const result = await pluginState.manager.rollback(trimmed || undefined, numAncestors);
   return { text: result.message, isError: !result.success };
+}
+
+async function runRollbackViaExecutor(
+  ws: string,
+  target?: string,
+  numAncestors?: number,
+): Promise<{ text: string; isError: boolean }> {
+  try {
+    const executor = new CommandExecutor();
+    const output = await executor.rollback(ws, target, numAncestors);
+    if (output.exitCode !== 0) {
+      const label = target || `ancestors=${numAncestors}`;
+      return { text: mapErrorToLLMMessage(output.stderr, { id: label }), isError: true };
+    }
+    const desc = target ? `Rolled back to ${target}` : `Rolled back ${numAncestors} ancestor(s)`;
+    return { text: desc, isError: false };
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    return { text: `Rollback error: ${msg}`, isError: true };
+  }
 }
 
 export async function handleListCheckpoints(): Promise<{
@@ -203,7 +228,7 @@ export async function handleDiff(
       isError: true,
     };
   }
-  const result = await pluginState.manager.execDiffRaw(fromArg, toArg ?? "HEAD");
+  const result = await pluginState.manager.execDiffRaw(fromArg, toArg);
   return { text: result.text, isError: !result.success };
 }
 
@@ -233,106 +258,157 @@ export async function handleConfig(
     const cfg = pluginState.resolvedConfig;
     const lines: string[] = ["Current ws-ckpt configuration:\n"];
     lines.push(`  autoCheckpoint: ${cfg.autoCheckpoint}`);
-    const autoCleanupDisabled = daemonAutoCleanup.cleanupNum === undefined && daemonAutoCleanup.cleanupDuration === undefined;
-    lines.push(
-      `  maxSnapshotsNum: ${
-        daemonAutoCleanup.cleanupNum !== undefined
-          ? daemonAutoCleanup.cleanupNum
-          : autoCleanupDisabled ? "not set - auto-cleanup disabled" : "not set"
-      }`,
-    );
-    lines.push(
-      `  maxSnapshotsDuration: ${
-        daemonAutoCleanup.cleanupDuration !== undefined
-          ? daemonAutoCleanup.cleanupDuration
-          : autoCleanupDisabled ? "not set - auto-cleanup disabled" : "not set"
-      }`,
-    );
+
+    // Always query daemon via `--format json` (stable versioned wire shape;
+    // text format isn't a contract). No module-level cache — render
+    // directly from this call's parsed result. Aligns with hermes plugin
+    // and removes by construction the cross-call RMW race the old cache
+    // had. Daemon unreachable / parse-error are reported explicitly; we
+    // NEVER fall back to a potentially-stale "last-known" value without
+    // saying so, and NEVER silently degrade either to "disabled" (that
+    // conflation was the original openclaw bug).
+    const cmd = new CommandExecutor();
+    const cfgResult = await cmd.config();
+    if (cfgResult.exitCode !== 0) {
+      lines.push(`  maxSnapshotsNum: (daemon unreachable)`);
+      lines.push(`  maxSnapshotsDuration: (daemon unreachable)`);
+      lines.push(`  workspace: ${cfg.workspace}`);
+      lines.push(`\n(could not query daemon: ${cfgResult.stderr.trim() || "no output"})`);
+      return { text: lines.join("\n"), isError: false };
+    }
+    const parsed = parseWorkspaceCleanupJson(cfgResult.stdout);
+    switch (parsed.kind) {
+      case "parse-error":
+        lines.push(`  maxSnapshotsNum: (unknown — daemon response unparseable)`);
+        lines.push(`  maxSnapshotsDuration: (unknown — daemon response unparseable)`);
+        break;
+      case "disabled":
+        lines.push(`  maxSnapshotsNum: not set - auto-cleanup disabled`);
+        lines.push(`  maxSnapshotsDuration: not set - auto-cleanup disabled`);
+        break;
+      case "count":
+        lines.push(`  maxSnapshotsNum: ${parsed.num}`);
+        lines.push(`  maxSnapshotsDuration: not set`);
+        break;
+      case "age":
+        lines.push(`  maxSnapshotsNum: not set`);
+        lines.push(`  maxSnapshotsDuration: ${parsed.duration}`);
+        break;
+    }
     lines.push(`  workspace: ${cfg.workspace}`);
-    lines.push("\nNote: maxSnapshotsNum / maxSnapshotsDuration are ws-ckpt global daemon settings.");
+    const schedules = cfg.cronSchedules ?? [];
+    if (schedules.length > 0) {
+      lines.push("  cronSchedules:");
+      for (const expr of schedules) lines.push(`    - ${expr}`);
+    } else {
+      lines.push("  cronSchedules:  (disabled)");
+    }
+    lines.push("\nNote: maxSnapshotsNum / maxSnapshotsDuration are this workspace's effective auto-cleanup policy (per-ws override on top of the daemon default).");
+    if (parsed.kind === "parse-error") {
+      lines.push(`\n(daemon response did not match expected schema: ${parsed.reason})`);
+    }
     return { text: lines.join("\n"), isError: false };
   }
 
   if (act === "update" || act === "set") {
     if (!key) {
       return {
-        text: "Usage: ws-ckpt-config update <key> <value>\n  Available keys: autoCheckpoint, maxSnapshotsNum, maxSnapshotsDuration, workspace",
+        text: "Usage: ws-ckpt-config update <key> <value>\n  Available keys: autoCheckpoint, cronSchedules, maxSnapshotsNum, maxSnapshotsDuration, workspace",
         isError: true,
       };
     }
 
+    // Workspace resolution + per-ws scoping live in `cmd.config()`: it falls
+    // back to `pluginState.resolvedConfig.workspace`, refuses (exit 2) if
+    // neither is set, and reports the chosen ws via `usedWorkspace`.
+
     if (key === "maxSnapshotsNum") {
       if (value === undefined) {
-        return { text: "maxSnapshotsNum requires a value (positive integer, or \"unset\" to disable auto-cleanup)", isError: true };
+        return { text: "maxSnapshotsNum requires a value (positive integer, or \"unset\" to restore inherit-global)", isError: true };
       }
 
-      // --- unset path ---
+      // unset = restore default (delete policy.toml) so admin's later global toggle wins.
       if (value === "unset") {
-        daemonAutoCleanup.cleanupNum = undefined;
         const cmd = new CommandExecutor();
-        const result = await cmd.config({ disableAutoCleanup: true });
+        const result = await cmd.config(undefined, { reset: true });
         if (result.exitCode !== 0) {
-          return { text: `Failed to disable auto-cleanup on daemon: ${result.stderr}`, isError: true };
+          return { text: `Failed to reset workspace policy: ${result.stderr}`, isError: true };
         }
-        return { text: "Cleared: maxSnapshotsNum unset — auto-cleanup disabled on ws-ckpt daemon.", isError: false };
+        return { text: `Cleared: maxSnapshotsNum unset — workspace ${result.usedWorkspace} now inherits global auto-cleanup.`, isError: false };
       }
 
       // --- set path ---
-      const num = parseInt(value, 10);
-      if (isNaN(num) || num < 1) {
+      // parseInt("20abc") returns 20 (silent truncation); reject anything that
+      // isn't a clean positive-integer literal so we match hermes's int(value).
+      const trimmed = value.trim();
+      if (!/^[1-9]\d*$/.test(trimmed)) {
         return { text: "maxSnapshotsNum must be a positive integer", isError: true };
       }
+      const num = Number(trimmed);
       const cmd = new CommandExecutor();
-      const result = await cmd.config({ enableAutoCleanup: true, autoCleanupKeep: String(num) });
+      const result = await cmd.config(undefined, { enableAutoCleanup: true, autoCleanupKeep: String(num) });
       if (result.exitCode !== 0) {
-        return { text: `Failed to configure daemon: ${result.stderr}`, isError: true };
+        return { text: `Failed to configure workspace: ${result.stderr}`, isError: true };
       }
-      daemonAutoCleanup.cleanupNum = num;
-      daemonAutoCleanup.cleanupDuration = undefined; // mutually exclusive
-      return { text: `Updated ws-ckpt global daemon config: maxSnapshotsNum = ${num} (auto-cleanup enabled, keep ${num})`, isError: false };
+      return { text: `Updated workspace policy for ${result.usedWorkspace}: maxSnapshotsNum = ${num} (auto-cleanup enabled, keep ${num})`, isError: false };
     }
 
     if (key === "maxSnapshotsDuration") {
       if (value === undefined) {
-        return { text: "maxSnapshotsDuration requires a value (e.g. \"7d\", \"24h\", or \"unset\" to disable auto-cleanup)", isError: true };
+        return { text: "maxSnapshotsDuration requires a value (e.g. \"7d\", \"24h\", or \"unset\" to restore inherit-global)", isError: true };
       }
 
-      // --- unset path ---
+      // unset = restore default (delete policy.toml) so admin's later global toggle wins.
       if (value === "unset") {
-        daemonAutoCleanup.cleanupDuration = undefined;
         const cmd = new CommandExecutor();
-        const result = await cmd.config({ disableAutoCleanup: true });
+        const result = await cmd.config(undefined, { reset: true });
         if (result.exitCode !== 0) {
-          return { text: `Failed to disable auto-cleanup on daemon: ${result.stderr}`, isError: true };
+          return { text: `Failed to reset workspace policy: ${result.stderr}`, isError: true };
         }
-        return { text: "Cleared: maxSnapshotsDuration unset — auto-cleanup disabled on ws-ckpt daemon.", isError: false };
+        return { text: `Cleared: maxSnapshotsDuration unset — workspace ${result.usedWorkspace} now inherits global auto-cleanup.`, isError: false };
       }
 
       // --- set path ---
       const cmd = new CommandExecutor();
-      const result = await cmd.config({ enableAutoCleanup: true, autoCleanupKeep: value });
+      const result = await cmd.config(undefined, { enableAutoCleanup: true, autoCleanupKeep: value });
       if (result.exitCode !== 0) {
-        return { text: `Failed to configure daemon: ${result.stderr}`, isError: true };
+        return { text: `Failed to configure workspace: ${result.stderr}`, isError: true };
       }
-      daemonAutoCleanup.cleanupDuration = value;
-      daemonAutoCleanup.cleanupNum = undefined; // mutually exclusive
-      return { text: `Updated ws-ckpt global daemon config: maxSnapshotsDuration = ${value} (auto-cleanup enabled, keep ${value})`, isError: false };
+      return { text: `Updated workspace policy for ${result.usedWorkspace}: maxSnapshotsDuration = ${value} (auto-cleanup enabled, keep ${value})`, isError: false };
     }
 
     if (key === "autoCheckpoint") {
-      const coerced = value === "true";
+      if (value === undefined) {
+        return { text: 'autoCheckpoint requires a value: "true" or "false"', isError: true };
+      }
+      const normalized = value.trim().toLowerCase();
+      // LLM tool callers and shell users emit a wide vocabulary; accept the
+      // common bool aliases instead of failing silently for anyone who didn't
+      // read stderr. Canonical form remains "true"/"false" in tool descriptions.
+      let coerced: boolean;
+      if (["true", "1", "yes", "on", "enabled"].includes(normalized)) {
+        coerced = true;
+      } else if (["false", "0", "no", "off", "disabled"].includes(normalized)) {
+        coerced = false;
+      } else {
+        return { text: `autoCheckpoint must be "true" or "false" (got "${value}")`, isError: true };
+      }
       if (coerced) {
         const ws = pluginState.resolvedConfig.workspace;
-        if (ws && cwdInsideWorkspace(ws)) {
-          return { text: CWD_INSIDE_WORKSPACE_REASON, isError: true };
+        if (ws) {
+          const cwdCheck = cwdInsideWorkspace(ws);
+          if (cwdCheck.inside) {
+            return { text: cwdInsideWorkspaceReason(cwdCheck.cwd, ws), isError: true };
+          }
         }
       }
       pluginState.resolvedConfig.autoCheckpoint = coerced;
-      const persistHint = coerced
-        ? `\n\nNote: This change is in-memory only and will reset on Gateway restart.\nTo persist, run:\n  openclaw config set plugins.entries.ws-ckpt.config.autoCheckpoint true --strict-json\n(This will cause a Gateway restart.)`
-        : `\n\nNote: This change is in-memory only and will reset on Gateway restart.\nTo persist, run:\n  openclaw config set plugins.entries.ws-ckpt.config.autoCheckpoint false --strict-json\n(This will cause a Gateway restart.)`;
+      const persistErr = persistConfig({ autoCheckpoint: coerced });
+      const persistNote = persistErr
+        ? `\n\nWARNING: Failed to persist config: ${persistErr}. Change is in-memory only.`
+        : "";
       return {
-        text: `Config updated: autoCheckpoint = ${coerced}${persistHint}`,
+        text: `Config updated: autoCheckpoint = ${coerced}${persistNote}`,
         isError: false,
       };
     }
@@ -341,15 +417,51 @@ export async function handleConfig(
       if (!value) {
         return { text: "workspace requires a path value", isError: true };
       }
+      const oldWs = pluginState.resolvedConfig.workspace;
       pluginState.resolvedConfig.workspace = value;
+      const schedules = pluginState.resolvedConfig.cronSchedules ?? [];
+      const warnings = await CrontabManager.migrate(oldWs, value, schedules);
+      const persistErr = persistConfig({ workspace: value });
+      let msg = `Config updated: workspace = ${value}`;
+      if (persistErr) msg += `\n\nWARNING: Failed to persist config: ${persistErr}. Change is in-memory only.`;
+      if (warnings.length > 0) msg += "\n\n" + warnings.join("\n");
+      return { text: msg, isError: false };
+    }
+
+    if (key === "cronSchedules") {
+      if (value === undefined) {
+        return {
+          text: 'cronSchedules requires a value. Use: add "EXPR", remove "EXPR", or set \'["EXPR"]\'',
+          isError: true,
+        };
+      }
+      const ws = pluginState.resolvedConfig.workspace;
+      if (!ws) {
+        return { text: "No workspace configured", isError: true };
+      }
+      const current = [...(pluginState.resolvedConfig.cronSchedules ?? [])];
+      const parsed = parseSchedulesUpdate(value, current);
+      if ("error" in parsed) {
+        return { text: parsed.error, isError: true };
+      }
+      pluginState.resolvedConfig.cronSchedules = parsed.schedules;
+      const persistErr = persistConfig({ cronSchedules: parsed.schedules });
+      let warnings = "";
+      if (persistErr) {
+        warnings += `\n\nWARNING: Failed to persist config: ${persistErr}. Change is in-memory only.`;
+      }
+      if (!(await CrontabManager.syncWithRetry(ws, parsed.schedules))) {
+        warnings += "\n\nWARNING: Failed to sync crontab after 3 attempts. " +
+          "Config saved but cron snapshots will not run until next session start or manual retry.";
+      }
       return {
-        text: `Config updated: workspace = ${value} (in-memory, will reset on Gateway restart)`,
+        text: `cronSchedules updated: ${parsed.schedules.length > 0 ? JSON.stringify(parsed.schedules) : "(disabled)"}` + warnings,
         isError: false,
       };
     }
 
     return {
-      text: `Unknown config key: ${key}. Available: autoCheckpoint, maxSnapshotsNum, maxSnapshotsDuration, workspace`,
+      text: `Unknown config key: ${key}. Available: autoCheckpoint, cronSchedules, maxSnapshotsNum, maxSnapshotsDuration, workspace`,
       isError: true,
     };
   }

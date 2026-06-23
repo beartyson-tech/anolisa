@@ -16,7 +16,7 @@ permissions:
 jobs:
   build-rpm:
     name: Build agent-sec-core RPM
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, ubuntu]
     container:
       image: alibaba-cloud-linux-4-registry.cn-hangzhou.cr.aliyuncs.com/alinux4/alinux4:latest
     steps:
@@ -101,7 +101,12 @@ jobs:
           from packaging.version import Version
 
           with open('src/agent-sec-core/agent-sec-cli/requirements.txt') as f:
-              reqs = [l.strip() for l in f if l.strip() and not l.strip().startswith('#')]
+              reqs = []
+              for line in f:
+                  s = line.strip().rstrip('\\').strip()
+                  if not s or s.startswith('#') or s.startswith('--hash='):
+                      continue
+                  reqs.append(s)
           failed = []
           skipped = 0
           for raw in reqs:

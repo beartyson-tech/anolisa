@@ -9,8 +9,9 @@
 import crypto from "node:crypto";
 import type { OpenClawPluginApi, PluginHookMessageReceivedEvent } from "../types-shim.js";
 import type { PluginConfig } from "./types.js";
-import { pluginState, cwdInsideWorkspace, CWD_INSIDE_WORKSPACE_REASON } from "./state.js";
+import { pluginState, cwdInsideWorkspace, cwdInsideWorkspaceReason } from "./state.js";
 import { mapErrorToLLMMessage } from "./btrfs-manager.js";
+import { CrontabManager } from "./cron.js";
 
 // ---------------------------------------------------------------------------
 // SnapshotTracker — tracks message / step counters for hooks
@@ -55,9 +56,10 @@ export function registerHooks(api: OpenClawPluginApi, config: PluginConfig): voi
     if (!pluginState.manager || !pluginState.environmentReady) return;
 
     const workspace = pluginState.resolvedConfig?.workspace;
-    if (workspace && cwdInsideWorkspace(workspace)) {
+    const cwdCheckEnd = workspace ? cwdInsideWorkspace(workspace) : undefined;
+    if (cwdCheckEnd?.inside) {
       config.autoCheckpoint = false;
-      console.warn(`[ws-ckpt] Disabling auto-checkpoint: ${CWD_INSIDE_WORKSPACE_REASON}`);
+      console.warn(`[ws-ckpt] Disabling auto-checkpoint: ${cwdInsideWorkspaceReason(cwdCheckEnd.cwd, workspace!)}`);
     } else {
       const snapshotId = crypto.randomUUID().slice(0, 8);
       const message = tracker.getLastUserMessage() ?? "turn end";
@@ -81,15 +83,33 @@ export function registerHooks(api: OpenClawPluginApi, config: PluginConfig): voi
     }
   }, { priority: 0 });
 
-  // Hook: session_start — create initial checkpoint
+  // Hook: session_start — sync cron + create initial checkpoint
   api.on("session_start", async (_event: unknown) => {
+    // Sync cron schedules — independent of autoCheckpoint
+    const cronWs = pluginState.resolvedConfig?.workspace;
+    if (cronWs) {
+      const schedules = config.cronSchedules ?? [];
+      if (schedules.length > 0) {
+        try {
+          if (await CrontabManager.syncWithRetry(cronWs, schedules)) {
+            console.log(`[ws-ckpt] Cron synced: ${schedules.length} schedule(s)`);
+          } else {
+            console.warn("[ws-ckpt] Cron sync failed after 3 attempts");
+          }
+        } catch (err) {
+          console.warn("[ws-ckpt] Cron sync error:", err instanceof Error ? err.message : String(err));
+        }
+      }
+    }
+
     if (!config.autoCheckpoint) return;
     const workspace = pluginState.resolvedConfig?.workspace;
     if (!pluginState.manager || !pluginState.environmentReady || !workspace) return;
 
-    if (cwdInsideWorkspace(workspace)) {
+    const cwdCheckStart = cwdInsideWorkspace(workspace);
+    if (cwdCheckStart.inside) {
       config.autoCheckpoint = false;
-      console.warn(`[ws-ckpt] Disabling auto-checkpoint: ${CWD_INSIDE_WORKSPACE_REASON}`);
+      console.warn(`[ws-ckpt] Disabling auto-checkpoint: ${cwdInsideWorkspaceReason(cwdCheckStart.cwd, workspace)}`);
     } else {
       try {
         await pluginState.manager.initialize(workspace);

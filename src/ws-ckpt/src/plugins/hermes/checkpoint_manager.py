@@ -8,11 +8,13 @@ and returns structured results.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .config import HermesPluginConfig, MSG_TRUNCATE_LEN
+from .config import HermesPluginConfig, MSG_TRUNCATE_LEN, load_config
 
 DEFAULT_TIMEOUT_S = 30
 
@@ -50,19 +52,38 @@ def map_error_to_message(stderr: str, context: Optional[Dict[str, Any]] = None) 
 
     lowered = stderr.lower()
 
-    if "not initialized" in lowered:
-        return f"Workspace not initialized for ws-ckpt.{ctx_str}"
     # CLI environment issues take priority over generic "not found" (snapshot)
     if "binary not found" in lowered or "not found on path" in lowered:
         return f"ws-ckpt CLI not found on PATH.{ctx_str}"
-    if "not found" in lowered or "no such" in lowered:
-        return f"Snapshot not found.{ctx_str}"
-    if "daemon" in lowered or "connection" in lowered:
-        return f"ws-ckpt daemon is not responding. Is it running?{ctx_str}"
-    if "permission" in lowered:
-        return f"Permission denied.{ctx_str}"
     if "timeout" in lowered:
         return f"Command timed out.{ctx_str}"
+    if "already exists" in lowered:
+        return f"Snapshot already exists in this workspace. Use a different ID.{ctx_str}"
+    if "active write" in lowered or "write operations" in lowered:
+        return f"Workspace has active write operations. Wait a moment and retry.{ctx_str}"
+    if "insufficient" in lowered:
+        return f"Insufficient disk space for snapshot. Delete old snapshots to free space.{ctx_str}"
+    # daemon flattens anyhow chains via `format!("{:#}", e)`, so inner io errors leak generic substrings.
+    if "cwd scan failed" in lowered:
+        return (
+            "ws-ckpt could not scan /proc to verify workspace occupants "
+            "(typically a transient /proc or canonicalize race). "
+            "This is retryable — wait a moment and try again."
+            f"{ctx_str}"
+        )
+    if "have cwd inside workspace" in lowered:
+        return (
+            "Other processes have their working directory inside the workspace. "
+            "ws-ckpt cannot proceed because the symlink swap would break those processes. "
+            "This is NOT retryable. The user must move affected processes out of the workspace."
+            f"{ctx_str}"
+        )
+    if "daemon is not running" in lowered or "daemon is starting up" in lowered:
+        return f"ws-ckpt daemon is not responding. Is it running?{ctx_str}"
+    if "not found" in lowered and "snapshot" in lowered:
+        return f"Snapshot not found.{ctx_str}"
+    if "not found" in lowered and "workspace" in lowered:
+        return f"Workspace not found.{ctx_str}"
 
     return f"ws-ckpt error: {stderr.strip()}{ctx_str}"
 
@@ -109,6 +130,7 @@ class CheckpointManager:
                 capture_output=True,
                 text=True,
                 timeout=DEFAULT_TIMEOUT_S,
+                env={**os.environ, "WS_CKPT_AGENT_NAME": "hermes"},
             )
             return CommandOutput(
                 exit_code=result.returncode,
@@ -181,3 +203,42 @@ class CheckpointManager:
             message=f"Checkpoint created: {snapshot_id}",
             snapshot=snapshot_id,
         )
+
+
+# ---------------------------------------------------------------------------
+# Singleton & workspace helpers (shared by __init__ and tools)
+# ---------------------------------------------------------------------------
+
+_manager: Optional[CheckpointManager] = None
+
+
+def get_manager() -> CheckpointManager:
+    """Return (or create) the singleton CheckpointManager."""
+    global _manager
+    if _manager is None:
+        config = load_config()
+        _manager = CheckpointManager(config)
+        print("[ws-ckpt] Plugin initialized", flush=True)
+    return _manager
+
+
+def cwd_inside_workspace(workspace: str) -> tuple[bool, str]:
+    """Return (inside, cwd) — whether the current cwd is the workspace or a descendant."""
+    try:
+        cwd = Path(os.getcwd()).resolve()
+    except (FileNotFoundError, OSError):
+        return False, ""
+    try:
+        ws_path = Path(workspace).resolve()
+    except (FileNotFoundError, OSError):
+        return False, str(cwd)
+    return cwd == ws_path or ws_path in cwd.parents, str(cwd)
+
+
+def cwd_inside_workspace_reason(cwd: str, workspace: str) -> str:
+    return (
+        f"Refused: cwd={cwd} is inside workspace={workspace}. "
+        "ws-ckpt replaces the workspace inode during init/checkpoint/rollback, "
+        "which would invalidate the process cwd. "
+        "The user must launch the session from outside the workspace directory."
+    )
